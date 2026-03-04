@@ -1,9 +1,9 @@
-TRAIN_TEST_SPLIT=navtest
-CACHE_PATH=YOUR_PATH_TO_METRIC_CACHE
+TRAIN_TEST_SPLIT=navtrain
+metric_cache_path=$NAVSIM_EXP_ROOT/navtrain_metric_cache
 
-python $NAVSIM_DEVKIT_ROOT/navsim/planning/script/run_pdm_score.py \
+python $NAVSIM_DEVKIT_ROOT/navsim/planning/script/run_pdm_score_one_stage.py \
 train_test_split=$TRAIN_TEST_SPLIT \
 agent=human_agent \
-experiment_name=human_agent \
-traffic_agents_policy=non_reactive \
-metric_cache_path=$CACHE_PATH \
+experiment_name=human_agent_navtrain_pdm_score_one_stage \
+traffic_agents=reactive \
+metric_cache_path=$metric_cache_path \

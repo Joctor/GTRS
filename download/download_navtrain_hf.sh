@@ -15,12 +15,13 @@ for split in {1..32}; do
     rm -r navtrain_current_${split}
 done
 
-for split in {1..32}; do
-    wget https://huggingface.co/datasets/OpenDriveLab/OpenScene/resolve/main/navsim/navtrain_history_${split}.tgz
-    echo "Extracting file navtrain_history_${split}.tgz"
-    tar -xzf navtrain_history_${split}.tgz
-    rm navtrain_history_${split}.tgz
+# without history
+# for split in {1..32}; do
+#     wget https://huggingface.co/datasets/OpenDriveLab/OpenScene/resolve/main/navsim/navtrain_history_${split}.tgz
+#     echo "Extracting file navtrain_history_${split}.tgz"
+#     tar -xzf navtrain_history_${split}.tgz
+#     rm navtrain_history_${split}.tgz
 
-    rsync -rv navtrain_history_${split}/* trainval_sensor_blobs/trainval
-    rm -r navtrain_history_${split}
-done
+#     rsync -rv navtrain_history_${split}/* trainval_sensor_blobs/trainval
+#     rm -r navtrain_history_${split}
+# done

@@ -28,7 +28,8 @@ from nuplan.planning.simulation.trajectory.trajectory_sampling import Trajectory
 from torch import Tensor
 
 from navsim.agents.abstract_agent import AbstractAgent
-from navsim.agents.dp.dp_agent import DPAgent
+#from navsim.agents.dp.dp_agent import DPAgent
+from navsim.agents.flow.flow_agent import FlowAgent
 from navsim.agents.gtrs_dense.gtrs_agent import GTRSAgent
 from navsim.agents.gtrs_dense.hydra_features import state2traj
 from navsim.agents.transfuser.transfuser_agent import TransfuserAgent
@@ -70,6 +71,8 @@ class AgentLightningModule(pl.LightningModule):
 
         if isinstance(self.agent, TransfuserAgent):
             loss, loss_dict = self.agent.compute_loss(features, targets, prediction)
+        elif isinstance(self.agent, FlowAgent):
+            loss, loss_dict = self.agent.compute_loss(features, targets, prediction, tokens)
         else:
             loss, loss_dict = self.agent.compute_loss(features, targets, prediction, tokens)
 
@@ -110,10 +113,32 @@ class AgentLightningModule(pl.LightningModule):
             return self.predict_step_combined(batch, batch_idx)
         if isinstance(self.agent, GTRSAgent):
             return self.predict_step_hydra(batch, batch_idx)
-        elif isinstance(self.agent, DPAgent):
-            return self.predict_step_dp_traj(batch, batch_idx)
+        # elif isinstance(self.agent, DPAgent):
+        #     return self.predict_step_dp_traj(batch, batch_idx)
+        elif isinstance(self.agent, FlowAgent):
+            return self.predict_step_flow(batch, batch_idx)
         else:
             raise ValueError('unsupported agent')
+    
+    def predict_step_flow(
+            self,
+            batch: Tuple[Dict[str, Tensor], Dict[str, Tensor]],
+            batch_idx: int
+    ):
+        features, targets, tokens = batch
+        self.agent.eval()
+
+        with torch.no_grad():
+            predictions = self.agent.forward(features)
+            poses = predictions["trajectory"]
+
+        result = {}
+        for index, (pose, token) in enumerate(zip(poses.cpu().numpy(), tokens)):
+            proposal = Trajectory(pose)
+            result[token] = {'trajectory': proposal}
+            
+        return result
+
 
     def predict_step_dp_traj(
             self,

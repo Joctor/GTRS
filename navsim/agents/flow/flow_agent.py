@@ -74,6 +74,7 @@ def flow_loss_bev(
     )
     return total_loss, {
         'total_loss': total_loss,
+        'epdms_score':torch.max(predictions['epdms_score'], dim=1)[0].mean().item(),
         'flow_loss': flow_loss,
         'score_loss': score_loss.item(),
         **score_loss_dict,
@@ -184,10 +185,11 @@ class FlowAgent(AbstractAgent):
     def get_training_callbacks(self) -> List[pl.Callback]:
         ckpt_callback_best = ModelCheckpoint(
             save_top_k=1,
-            monitor="train/total_loss_epoch",
-            mode="min",
+            save_last=True,
+            monitor="val/epdms_score",
+            mode="max",
             dirpath=f"{os.environ.get('NAVSIM_EXP_ROOT')}/{self._config.ckpt_path}/",
-            filename="{epoch:02d}-{step:04d}"
+            filename="best-{epoch:02d}-{step:04d}"
         )
 
         return [

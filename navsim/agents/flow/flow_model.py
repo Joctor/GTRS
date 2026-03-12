@@ -83,7 +83,7 @@ class FlowHead(nn.Module):
         gt_trajectory = gt_trajectory.float()
         delta_t = 1 / self.num_poses
 
-        zeros = torch.zeros(B, 1, 3)
+        zeros = torch.zeros_like(gt_trajectory[:, :1, :], device=device)  # (B, 1, 3)
         gt_trajectory = torch.cat([zeros, gt_trajectory], dim=1)
 
         # 2. 为每一段采样一个时间点 → (B, 8)
@@ -244,10 +244,10 @@ class FlowModel(nn.Module):
 
         scene_tokens = self.scene_embeds.repeat(batch_size, 1, 1, 1)
 
-        #img_tokens = self.image_backbone(camera_feature, scene_tokens)
-        img_tokens = torch.randn(batch_size, 
-                                self._config.num_cams * self._config.num_scene_tokens, 
-                                self._config.tf_d_model)
+        img_tokens = self.image_backbone(camera_feature, scene_tokens)
+        # img_tokens = torch.randn(batch_size, 
+        #                         self._config.num_cams * self._config.num_scene_tokens, 
+        #                         self._config.tf_d_model)
         
         if self._config.use_hist_ego_status:
             ego_token = self.hist_encoding(status_feature)

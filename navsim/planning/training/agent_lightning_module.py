@@ -51,12 +51,6 @@ class AgentLightningModule(pl.LightningModule):
         super().__init__()
         self.combined = combined
         self.agent = agent
-        self.v_params = get_pacifica_parameters()
-        try:
-            self.dp_preds_2hz = pickle.load(open(os.getenv('DP_PREDS'), 'rb'))
-        except Exception:
-            traceback.print_exc()
-            self.dp_preds_2hz = dict()
 
     def _step(self, batch: Tuple[Dict[str, Tensor], Dict[str, Tensor]], logging_prefix: str) -> Tensor:
         """

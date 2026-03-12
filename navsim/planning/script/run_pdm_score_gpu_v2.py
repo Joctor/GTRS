@@ -275,7 +275,7 @@ def main(cfg: DictConfig) -> None:
         for d in proc_prediction:
             merged_predictions.update(d)
 
-    pickle.dump(merged_predictions, open(dump_path, 'wb'))
+    # pickle.dump(merged_predictions, open(dump_path, 'wb'))
 
     data_points = [
         {

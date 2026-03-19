@@ -271,7 +271,7 @@ def main(cfg: DictConfig) -> None:
     pdm_score_df = create_scene_aggregators(
         start_adjacent_mapping, pdm_score_df, instantiate(cfg.simulator.proposal_sampling)
     )
-    pdm_score_df = compute_final_scores(pdm_score_df)
+    # pdm_score_df = compute_final_scores(pdm_score_df)
 
     num_sucessful_scenarios = pdm_score_df["valid"].sum()
     num_failed_scenarios = len(pdm_score_df) - num_sucessful_scenarios
@@ -290,13 +290,13 @@ def main(cfg: DictConfig) -> None:
     ]
 
     # Calculate average score
-    average_row = pdm_score_df[score_cols].mean(skipna=True)
-    average_row["token"] = "average_all_frames"
-    average_row["valid"] = pdm_score_df["valid"].all()
+    # average_row = pdm_score_df[score_cols].mean(skipna=True)
+    # average_row["token"] = "average_all_frames"
+    # average_row["valid"] = pdm_score_df["valid"].all()
 
     # append average and pseudo closed loop scores
     pdm_score_df = pdm_score_df[["token", "valid"] + score_cols]
-    pdm_score_df.loc[len(pdm_score_df)] = average_row
+    # pdm_score_df.loc[len(pdm_score_df)] = average_row
 
     save_path = Path(cfg.output_dir)
     timestamp = datetime.now().strftime("%Y.%m.%d.%H.%M.%S")
@@ -307,7 +307,7 @@ def main(cfg: DictConfig) -> None:
         Finished running evaluation.
             Number of successful scenarios: {num_sucessful_scenarios}.
             Number of failed scenarios: {num_failed_scenarios}.
-            Final average score of valid results: {pdm_score_df['score'].mean()}.
+            Final average score of valid results: .
             Results are stored in: {save_path / f"{timestamp}.csv"}.
         """
     )

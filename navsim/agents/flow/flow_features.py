@@ -158,6 +158,7 @@ class FlowTargetBuilder(AbstractTargetBuilder):
     def __init__(self, config: FlowConfig):
         self._config = config
         self.pdm_df = pd.read_csv(config.pdm_result_path)
+        self.pdm_df = self.pdm_df[self.pdm_df['valid'] == True]
 
     def get_unique_name(self) -> str:
         """Inherited, see superclass."""
@@ -192,7 +193,14 @@ class FlowTargetBuilder(AbstractTargetBuilder):
         row_data = self.pdm_df[self.pdm_df['token'] == token]
         
         if row_data.empty:
-            raise ValueError(f"Token {token} not found!")
+            # 【修改点】不再抛出异常，而是打印警告并返回全零张量
+            # 注意：在多进程环境下，print 可能不会立即显示，建议使用 logging 或写入文件
+            import sys
+            print(f"[WARNING] Token {token} not found in PDM results. Returning zeros.", file=sys.stderr)
+            
+            # 返回与正常情况形状一致的零张量
+            # gt_mult shape: (1, 4), gt_weighted shape: (1, 5)
+            return torch.zeros((1, 4), dtype=torch.float32), torch.zeros((1, 5), dtype=torch.float32)
         
         mult_cols = [
         'no_at_fault_collisions',

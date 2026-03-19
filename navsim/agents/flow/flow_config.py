@@ -13,7 +13,7 @@ class FlowConfig(TransfuserConfig):
     image_height: int = 672
     latent: bool = True
 
-    num_proposals: int = 16
+    num_proposals: int = 64
     use_hist_ego_status: bool = True
     hist_ego_len = 4
     hist_ego_dim = 11

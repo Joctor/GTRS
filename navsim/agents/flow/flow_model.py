@@ -123,15 +123,42 @@ class ScoreHead(nn.Module):
         )
         self.scorer_refine_attn = nn.TransformerDecoder(scorer_layer, num_layers=nlayers)
 
-        self.head_multipliers = self._build_head(d_model, d_ffn, 4)  # NC, DAC, DDC, TLC
-        self.head_weighted = self._build_head(d_model, d_ffn, 5)     # TTC, EP, LK, HC, EC
+        def build_head(d_in, d_hidden):
+            return nn.Sequential(
+                nn.Linear(d_in, d_hidden),
+                nn.ReLU(),
+                nn.Linear(d_hidden, 1)
+            )
 
-    def _build_head(self, d_in, d_hidden, d_out):
-        return nn.Sequential(
-            nn.Linear(d_in, d_hidden),
-            nn.ReLU(),
-            nn.Linear(d_hidden, d_out)
-        )
+        self.heads = nn.ModuleDict({
+            # --- Multipliers (安全因子) ---
+            'no_at_fault_collisions': build_head(d_model, d_ffn),      # NC
+            'drivable_area_compliance': build_head(d_model, d_ffn),    # DAC
+            'driving_direction_compliance': build_head(d_model, d_ffn),# DDC
+            'traffic_light_compliance': build_head(d_model, d_ffn),    # TLC
+            
+            # --- Weighted Scores (质量因子) ---
+            'time_to_collision_within_bound': build_head(d_model, d_ffn),           # TTC
+            'ego_progress': build_head(d_model, d_ffn),                # EP
+            'lane_keeping': build_head(d_model, d_ffn),                # LK
+            'history_comfort': build_head(d_model, d_ffn),             # HC
+            'extended_comfort': build_head(d_model, d_ffn),                 # EC
+        })
+
+        # 权重配置
+        self.weights = {
+            'time_to_collision_within_bound': 5.0,
+            'ego_progress': 5.0,
+            'lane_keeping': 2.0,
+            'history_comfort': 2.0,
+            'extended_comfort': 2.0
+        }
+        self.sum_weights = sum(self.weights.values())
+
+        self.multiplier_keys = ['no_at_fault_collisions', 'drivable_area_compliance', 
+                                'driving_direction_compliance', 'traffic_light_compliance']
+        self.weighted_keys = ['time_to_collision_within_bound', 'ego_progress', 'lane_keeping', 
+                              'history_comfort', 'extended_comfort']
 
     def forward(self, trajectories: torch.Tensor, trajectory_feature: torch.Tensor, 
                 kv: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -140,63 +167,89 @@ class ScoreHead(nn.Module):
             trajectories: (B, K, L, 3)
             trajectory_feature: (B*K, L, D) 来自 FlowHead
             kv: (B, N, D)
+        Returns:
+            Dictionary containing best trajectory, scores, and detailed head outputs.
         """
         B, K, L, _ = trajectories.shape
+        device = trajectories.device
         
-        # 1. 扩展 KV 和 Status
+        # 1. 扩展 KV
         kv_expanded = kv.repeat_interleave(K, dim=0) # (B*K, N, D)
         
-        # 2. 二次环境查询 (Refine)
-        # tgt: (B*K, L, D), memory: (B*K, N, D)
+        # 2. 二次环境查询 (Refine) & 池化
         refined_features = self.scorer_refine_attn(tgt=trajectory_feature, memory=kv_expanded)
+        pooled_feat = refined_features.mean(dim=1) # (B*K, D)
 
-        logits_mult = self.head_multipliers(refined_features.mean(dim=1)) 
-        logits_weighted = self.head_weighted(refined_features.mean(dim=1))
+        # 3. 获取所有头的 Logits (B*K)
+        logits = {}
+        for name, head in self.heads.items():
+            logits[name] = head(pooled_feat).squeeze(-1)
 
-        # 恢复形状为 (B, K, ...)
-        pred_mult = torch.sigmoid(logits_mult).view(B, K, 4) # (B, K, 4)
-        pred_weighted = torch.sigmoid(logits_weighted).view(B, K, 5) # (B, K, 5)
+        # --- 4. Log-Domain 计算总分 ---
         
-        # --- 定义权重 (根据 NAVSIM v2 EPDMS) ---
-        # Multipliers 不参与加权求和，而是作为连乘因子
-        # Weighted 指标权重
-        w_ttc, w_ep, w_lk, w_hc, w_ec = 5.0, 5.0, 2.0, 2.0, 2.0
-        sum_weights = w_ttc + w_ep + w_lk + w_hc + w_ec
+        # A. Multiplier 部分: Sum of Log-Probs
+        log_multiplier_sum = torch.zeros(B * K, device=device)
+        for key in self.multiplier_keys:
+            x = logits[key]
+            # ln(sigmoid(x)) = -softplus(-x)
+            log_p = -F.softplus(-x)
+            log_multiplier_sum += log_p
         
-        # 计算 Weighted Sum (归一化)
-        weighted_sum = (
-            w_ttc  * pred_weighted[:, :, 0] +
-            w_ep   * pred_weighted[:, :, 1] +
-            w_lk   * pred_weighted[:, :, 2] +
-            w_hc   * pred_weighted[:, :, 3] +
-            w_ec   * pred_weighted[:, :, 4]
-        ) / sum_weights # (B, K)
+        # B. Weighted 部分: Log(Sum of Weighted Probs)
+        weighted_sum_prob = torch.zeros(B * K, device=device)
+        for key in self.weighted_keys:
+            x = logits[key]
+            p = torch.sigmoid(x)
+            weighted_sum_prob += self.weights[key] * p
         
-        # 计算 Multiplier Product (连乘)
-        # NC (idx 0), DAC (idx 1), DDC (idx 2), TLC (idx 3)
-        multiplier_product = (
-            pred_mult[:, :, 0] * 
-            pred_mult[:, :, 1] * 
-            pred_mult[:, :, 2] * 
-            pred_mult[:, :, 3]
-        ) # (B, K)
+        weighted_sum_prob /= self.sum_weights
+        epsilon = 1e-8
+        log_weighted_sum = torch.log(weighted_sum_prob + epsilon)
+
+        # C. 最终 Log-Score
+        log_epdms_score = log_multiplier_sum + log_weighted_sum # (B*K)
+        log_epdms_score = log_epdms_score.view(B, K) # (B, K)
+
+        # --- 5. 【关键修复】组装 pred_mult 和 pred_weighted ---
         
-        # 最终 EPDMS 分数
-        epdms_score = multiplier_product * weighted_sum # (B, K)
-        best_idx = torch.argmax(epdms_score, dim=1, keepdim=True) # (B, 1)
+        # 我们需要输出两种形式以适配 Loss 和 分析：
+        # 1. Logits (用于 BCEWithLogits Loss)
+        # 2. Probs 或 Log-Probs (用于 MSE Loss 或 分析)
         
-        # Gather 最佳轨迹
+        # A. 组装 Multiplier (4项)
+        mult_logits_list = [logits[k] for k in self.multiplier_keys]
+        mult_probs_list = [torch.sigmoid(logits[k]) for k in self.multiplier_keys]
+        
+        # Stack -> (B*K, 4) -> View -> (B, K, 4)
+        pred_mult_logits = torch.stack(mult_logits_list, dim=-1).view(B, K, -1)
+        pred_mult_probs = torch.stack(mult_probs_list, dim=-1).view(B, K, -1)
+
+        # B. 组装 Weighted (5项)
+        weighted_logits_list = [logits[k] for k in self.weighted_keys]
+        weighted_probs_list = [torch.sigmoid(logits[k]) for k in self.weighted_keys]
+        
+        pred_weighted_logits = torch.stack(weighted_logits_list, dim=-1).view(B, K, -1)
+        pred_weighted_probs = torch.stack(weighted_probs_list, dim=-1).view(B, K, -1)
+
+        # 6. 选择最佳轨迹
+        best_idx = torch.argmax(log_epdms_score, dim=1, keepdim=True) # (B, 1)
         idx_expanded = best_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, L, 3)
-        best_trajectory = torch.gather(trajectories, 1, idx_expanded).squeeze(1) # (B, L, 3)
+        best_trajectory = torch.gather(trajectories, 1, idx_expanded).squeeze(1)
         
-        # 准备返回字典
+        # 7. 构建返回字典
         result = {
-            'trajectory': best_trajectory,                  # (B, L, 3) 最终输出
-            'all_trajectories': trajectories,               # (B, K, L, 3) 所有候选
-            'epdms_score': epdms_score,                     # (B, K) 总分
-            'pred_mult': pred_mult,                # (B, K, 4) 各项安全分
-            'pred_weighted': pred_weighted,         # (B, K, 5) 各项质量分
-            'best_idx': best_idx                            # (B, 1) 最佳索引
+            'trajectory': best_trajectory,                  # (B, L, 3)
+            'all_trajectories': trajectories,               # (B, K, L, 3)
+            'log_epdms_score': log_epdms_score,             # (B, K) 总分
+            
+            # --- 核心输出：为了适配 Loss 函数 ---
+            'pred_mult_logits': pred_mult_logits,           # (B, K, 4) 用于 BCE Loss
+            'pred_mult_probs': pred_mult_probs,             # (B, K, 4) 用于分析
+            
+            'pred_weighted_logits': pred_weighted_logits,   # (B, K, 5) (MSE通常不需要logit，但保留以防万一)
+            'pred_weighted_probs': pred_weighted_probs,     # (B, K, 5) 用于 MSE Loss
+            
+            'best_idx': best_idx                            # (B, 1)
         }
         
         return result

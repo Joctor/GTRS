@@ -19,38 +19,45 @@ from navsim.planning.training.abstract_feature_target_builder import (
 )
 
 def get_score_loss(preds, targets):
-    probs_mult = preds['pred_mult']       # (B, K, 4)
-    probs_weighted = preds['pred_weighted']     # (B, K, 5)
-
-    gt_mult = targets['gt_mult']             # (B, K, 4) 或 (B, 4)
-    gt_weighted = targets['gt_weighted']     # (B, K, 5) 或 (B, 5)
-
-    gt_mult = gt_mult.expand(-1, probs_mult.shape[1], -1)
+    # 1. 获取专门用于 Loss 计算的字段
+    logits_mult = preds['pred_mult_logits']       # (B, K, 4) -> 用于 BCE
+    probs_weighted = preds['pred_weighted_probs'] # (B, K, 5) -> 用于 MSE
+    
+    gt_mult = targets['gt_mult']
+    gt_weighted = targets['gt_weighted']
+    
+    gt_mult = gt_mult.expand(-1, logits_mult.shape[1], -1)
     gt_weighted = gt_weighted.expand(-1, probs_weighted.shape[1], -1)
-
-    # 确保设备一致
-    device = probs_mult.device
+        
+    device = logits_mult.device
     gt_mult = gt_mult.to(device)
     gt_weighted = gt_weighted.to(device)
     
     # --- 计算 Loss ---
     loss_dict = {}
     total_loss = 0.0
+    
+    # Flatten to (B*K, N) for easier column-wise processing
+    b, k, _ = logits_mult.shape
+    logits_mult_flat = logits_mult.view(-1, 4)
+    gt_mult_flat = gt_mult.view(-1, 4)
+    probs_weighted_flat = probs_weighted.view(-1, 5)
+    gt_weighted_flat = gt_weighted.view(-1, 5)
+    
+    # 1. Multiplier Loss (BCE with Logits)
     mult_names = ['nc', 'dac', 'ddc', 'tlc']
     for i, name in enumerate(mult_names):
-        # 单独计算第 i 列的 Loss
-        l = F.binary_cross_entropy_with_logits(probs_mult[:, :, i], gt_mult[:, :, i])
-        loss_dict[f'{name}_loss'] = l.item() # 记录数值用于日志
-        total_loss += l * 2.0  # 累加到总 Loss (乘以权重)
+        l = F.binary_cross_entropy_with_logits(logits_mult_flat[:, i], gt_mult_flat[:, i])
+        loss_dict[f'{name}_loss'] = l.item()
+        total_loss += l
         
-    # --- 2. 单独计算 Weighted 的每一项 ---
+    # 2. Weighted Loss (MSE with Probs)
     weighted_names = ['ttc', 'ep', 'lk', 'hc', 'ec']
-    pred_scores = torch.sigmoid(probs_weighted)
     for i, name in enumerate(weighted_names):
-        l = F.mse_loss(pred_scores[:, :, i], gt_weighted[:, :, i])
-        loss_dict[f'{name}_loss'] = l.item() # 记录数值
-        total_loss += l * 1.0  # 累加到总 Loss
-    
+        l = F.mse_loss(probs_weighted_flat[:, i], gt_weighted_flat[:, i])
+        loss_dict[f'{name}_loss'] = l.item()
+        total_loss += l
+        
     return total_loss, loss_dict
 
 def flow_loss_bev(
@@ -74,7 +81,7 @@ def flow_loss_bev(
     )
     return total_loss, {
         'total_loss': total_loss,
-        'epdms_score':torch.max(predictions['epdms_score'], dim=1)[0].mean().item(),
+        'log_epdms_score':torch.max(predictions['log_epdms_score'], dim=1)[0].mean().item(),
         'flow_loss': flow_loss,
         'score_loss': score_loss.item(),
         **score_loss_dict,
@@ -186,7 +193,7 @@ class FlowAgent(AbstractAgent):
         ckpt_callback_best = ModelCheckpoint(
             save_top_k=1,
             save_last=True,
-            monitor="val/epdms_score",
+            monitor="val/log_epdms_score",
             mode="max",
             dirpath=f"{os.environ.get('NAVSIM_EXP_ROOT')}/{self._config.ckpt_path}/",
             filename="best-{epoch:02d}-{step:04d}"

@@ -37,24 +37,17 @@ def get_score_loss(preds, targets):
     loss_dict = {}
     total_loss = 0.0
     
-    # Flatten to (B*K, N) for easier column-wise processing
-    b, k, _ = logits_mult.shape
-    logits_mult_flat = logits_mult.view(-1, 4)
-    gt_mult_flat = gt_mult.view(-1, 4)
-    probs_weighted_flat = probs_weighted.view(-1, 5)
-    gt_weighted_flat = gt_weighted.view(-1, 5)
-    
     # 1. Multiplier Loss (BCE with Logits)
     mult_names = ['nc', 'dac', 'ddc', 'tlc']
     for i, name in enumerate(mult_names):
-        l = F.binary_cross_entropy_with_logits(logits_mult_flat[:, i], gt_mult_flat[:, i])
+        l = F.binary_cross_entropy_with_logits(logits_mult[:, :, i], gt_mult[:, :, i])
         loss_dict[f'{name}_loss'] = l.item()
         total_loss += l
         
     # 2. Weighted Loss (MSE with Probs)
     weighted_names = ['ttc', 'ep', 'lk', 'hc', 'ec']
     for i, name in enumerate(weighted_names):
-        l = F.mse_loss(probs_weighted_flat[:, i], gt_weighted_flat[:, i])
+        l = F.mse_loss(probs_weighted[:, :, i], gt_weighted[:, :, i])
         loss_dict[f'{name}_loss'] = l.item()
         total_loss += l
         

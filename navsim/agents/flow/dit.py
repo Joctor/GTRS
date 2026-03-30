@@ -6,6 +6,8 @@ from timm.models.vision_transformer import Mlp
 from timm.models.vision_transformer import Attention
 import torch.nn.functional as F
 
+def modulate(x, scale, shift):
+    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
 class TimestepEmbedder(nn.Module):
     def __init__(self, dim, nfreq=256):
@@ -32,50 +34,60 @@ class TimestepEmbedder(nn.Module):
         return embedding
 
     def forward(self, t):
-        t = t*1000
         t_freq = self.timestep_embedding(t, self.nfreq)
         t_emb = self.mlp(t_freq)
         return t_emb
 
-
-class RMSNorm(nn.Module):
-    def __init__(self, dim, **kwargs):
-        super().__init__()
-        self.scale = dim**0.5
-        self.g = nn.Parameter(torch.ones(1))
-
-    def forward(self, x):
-        return F.normalize(x, dim=-1) * self.scale * self.g
-
-
 class DiTBlock(nn.Module):
     def __init__(self, dim, num_heads, mlp_ratio=4.0):
         super().__init__()
-        self.norm1 = RMSNorm(dim)
-        self.attn = Attention(dim, num_heads=num_heads, qkv_bias=True, qk_norm=True, norm_layer=RMSNorm)
-        # flasth attn can not be used with jvp
-        self.attn.fused_attn = False
-        self.norm2 = RMSNorm(dim)
+        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.attn = Attention(dim, num_heads=num_heads, qkv_bias=True, qk_norm=True, norm_layer=nn.LayerNorm)
+        
+        self.cross_attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
+        self.norm_cross = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        
+        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         mlp_dim = int(dim * mlp_ratio)
         approx_gelu = lambda: nn.GELU(approximate="tanh")
         self.mlp = Mlp(
             in_features=dim, hidden_features=mlp_dim, act_layer=approx_gelu, drop=0
         )
+        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim, 9 * dim))
 
-    def forward(self, x):
-        x = x + self.attn(self.norm1(x))
-        x = x + self.mlp(self.norm2(x))
+    def forward(self, x, t, condition):
+        shift_msa, scale_msa, gate_msa, \
+        shift_cross, scale_cross, gate_cross, \
+        shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(t).chunk(9, dim=1)
+
+        x = x + gate_msa.unsqueeze(1) * self.attn(
+            modulate(self.norm1(x), scale_msa, shift_msa)
+        )
+
+        cross_out, _ = self.cross_attn(
+                modulate(self.norm_cross(x), scale_cross, shift_cross), 
+                condition, condition
+            )
+        x = x + gate_cross.unsqueeze(1) * cross_out
+
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(
+            modulate(self.norm2(x), scale_mlp, shift_mlp)
+        )
         return x
 
 
 class FinalLayer(nn.Module):
     def __init__(self, hidden_size, out_dim):
         super().__init__()
-        self.norm = RMSNorm(hidden_size)
+        self.norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.linear = nn.Linear(hidden_size, out_dim)
+        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size))
 
-    def forward(self, x):
-        return self.linear(self.norm(x))
+    def forward(self, x, t):
+        shift, scale = self.adaLN_modulation(t).chunk(2, dim=-1)
+        x = modulate(self.norm(x), shift, scale)
+        x = self.linear(x)
+        return x
 
 
 class MFDiT(nn.Module):
@@ -93,7 +105,7 @@ class MFDiT(nn.Module):
         
         self.t_embed = TimestepEmbedder(hidden_size)
         
-        self.pos_embed = nn.Embedding(num_poses, hidden_size)
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_poses, hidden_size))
 
         self.blocks = nn.ModuleList([
             DiTBlock(hidden_size, num_heads) for _ in range(depth)
@@ -113,7 +125,7 @@ class MFDiT(nn.Module):
         self.apply(_basic_init)
 
         # 2. Initialize learnable positional embeddings (hist + future)
-        nn.init.normal_(self.pos_embed.weight, std=0.02)  # for z_t (8 slots)
+        nn.init.normal_(self.pos_embed, std=0.02)  # for z_t (8 slots)
 
         # 3. Initialize timestep embedding MLP (like DiT)
         # Assuming TimestepEmbedder has: self.mlp = nn.Sequential(Linear, SiLU, Linear)
@@ -131,32 +143,22 @@ class MFDiT(nn.Module):
     def forward(self, z_t, t, keyval):
         """
         z_t: (B, L=8, D=3)
-        t: (B, L)
-        egostatus: (B, 4, 11)
+        t: (B, 1, 1)
+        keyval: (B, 64, 256)
         """
         B, L, D = z_t.shape
+        zt_emb = self.zt_embed(z_t) + self.pos_embed 
 
-        # 1. Encode future state tokens (z_t)
-        zt_emb = self.zt_embed(z_t)                     # (B, 8, H)
-        time_emb = self.t_embed(t)                      # (B, 8, H)
-        pos_indices = torch.arange(L, device=z_t.device)  # (L,)
-        pos_emb = self.pos_embed(pos_indices).unsqueeze(0)  # (1, L, H)
-        future_tokens = zt_emb + time_emb + pos_emb  # (B, 8, H)
-
-        # 3. IN-CONTEXT CONDITIONING: CONCATENATE!
-        x = torch.cat([keyval, future_tokens], dim=1)   # (B, 12, H)
-
+        time_emb = self.t_embed(t.squeeze(-1).squeeze(-1))       # (B, 8, H)
+        
+        x = zt_emb
         # 4. Pass through blocks
         for block in self.blocks:
-            x = block(x)
+            x = block(x, time_emb, keyval)
 
-        # 5. Predict only for future tokens
-        x_future = x[:, -L:, :]  # (B, 8, H)
-        v_t = self.final_layer(x_future)  # (B, 8, 3) ← only one argument!
-
-        # x_future作为block的输出，传给分数头
+        v_t = self.final_layer(x, time_emb)  # (B, 8, 3) ← only one argument!
         
-        return v_t, x_future
+        return v_t
 
 
 if __name__ == "__main__":
@@ -164,10 +166,10 @@ if __name__ == "__main__":
     model = MFDiT(input_size=D, num_poses=L, hidden_size=256, depth=2, num_heads=4)
 
     z_t = torch.randn(B, L, D)              
-    t = torch.rand(B, L)                    
-    bev = torch.randn(B, 64 + 4, 256)              
-    hist_ego = torch.randn(B, 4, 11)        
+    t = torch.rand(B, 1, 1)                    
+    img_token = torch.randn(B, 64, 256)              
+    ego_token = torch.randn(B, 4, 256)        
 
-    output = model(z_t, t, bev)
+    output = model(z_t, t, img_token)
     print("Input z_t shape:", z_t.shape)
     print("Output shape:", output[0].shape, output[1].shape)    # Should be (2, 8, 3)

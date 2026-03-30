@@ -19,91 +19,57 @@ class FlowHead(nn.Module):
         super().__init__()
         self.config = config
         self.num_poses = num_poses
+        self.state_size = config.state_size
         self.num_proposals = config.num_proposals
 
-        self.mfdit = MFDiT(input_size=3, 
+        self.mfdit = MFDiT(input_size=config.state_size, 
               num_poses=num_poses, 
               hidden_size=d_model, 
               depth=nlayers, 
               num_heads=nhead)
 
-    # 把生成的轨迹拼接上bev特征，送入分数头，得到pdm_score，再选出最高的轨迹
-    def forward(self, kv: torch.Tensor):
-        # bev_token + hist_ego + cur_ego + pos_emd
-        B = kv.shape[0]
-
-        # 1. 扩展 Batch
-        kv_expanded = kv.repeat_interleave(self.num_proposals, dim=0)
-        
-        # 2. 初始化状态：直接代表未来 8 个点 (t=1...8)
-        future_traj = torch.randn(B * self.num_proposals, self.num_poses, 3, device=kv.device)
-
-        segment_dt = 1.0 / self.num_poses
+    def forward(self, keyval):
+        # bev_token + pos_emd
+        B = keyval.shape[0]
+        device = keyval.device
 
         with torch.no_grad():
-            # s = 0 (因为只有一步，起始点就是唯一的查询点)
-            s = 0.0
-            
-            # --- 构造输入 ---
-            # 完整序列 [0, x_1, ..., x_8]
-            zeros = torch.zeros(B * self.num_proposals, 1, 3, device=kv.device)
-            full_traj = torch.cat([zeros, future_traj], dim=1)
-            
-            # 起点序列 [x_0, x_1, ..., x_7]
-            starts = full_traj[:, :-1, :]
-            
-            # 【关键】：当 s=0 时，z_t_input = starts
-            # 模型将基于“当前起点”预测“直达终点的速度”
-            z_t_input = starts 
-            
-            # 时间输入：每段的起始时间 [0, 1/8, 2/8, ..., 7/8]
-            segment_bases = torch.arange(self.num_poses, device=kv.device).float() * segment_dt
-            t_input = segment_bases.unsqueeze(0).expand(B * self.num_proposals, -1)
-            
-            # --- 模型预测 ---
-            # 模型看到起点，直接输出恒定速度 v ≈ (x_end - x_start) / dt
-            v_t, x_future = self.mfdit(z_t_input, t_input, kv_expanded)
-            
-            # 计算新的终点估计
-            new_ends = starts + v_t * segment_dt
-            
-            # 更新 future_traj (它代表 ends)
-            future_traj = new_ends
+            x_t = torch.randn(B, self.num_poses, self.state_size, device=device)  # (B, 8, 3)
+            num_steps = 10 
+            dt = 1.0 / num_steps
 
-        # 3. 恢复形状
-        trajectory_proposals = future_traj.view(B, self.num_proposals, self.num_poses, 3)
+            for i in range(num_steps):
+                # 构造时间步 t，从 0 到 1-dt
+                t_val = torch.full((B, 1, 1), i * dt, device=device)
+                
+                # 预测速度
+                v_t = self.mfdit(x_t, t_val, keyval)
+                
+                # 更新: x_{t+dt} = x_t + v_t * dt
+                x_t = x_t + v_t * dt
 
-        return trajectory_proposals, x_future
+            trajectory_proposals = x_t.view(-1, self.num_proposals, self.num_poses, self.state_size)
+            
+            return trajectory_proposals
     
-    def get_flow_loss(self, kv, gt_trajectory):
+    def get_flow_loss(self, keyval, gt_trajectory):
         # kv: (batch_size, num_bev_tokens + 4, config.tf_d_model)
         # gt_trajectory: (batch_size, 8, 3)
-        B = kv.shape[0]
-        device = kv.device
-        gt_trajectory = gt_trajectory.float()
-        delta_t = 1 / self.num_poses
-
-        zeros = torch.zeros_like(gt_trajectory[:, :1, :], device=device)  # (B, 1, 3)
-        gt_trajectory = torch.cat([zeros, gt_trajectory], dim=1)
-
-        # 2. 为每一段采样一个时间点 → (B, 8)
-        local_t = torch.rand(B, self.num_poses, device=device)  # ~ U(0,1)
-        segment_start = torch.arange(self.num_poses, device=device).float() * delta_t  # (8,)
-        global_t = segment_start + local_t * delta_t  # (B, 8)
-
-        # 3. 提取每段的起点和终点（无需循环！）
-        x_k  = gt_trajectory[:, :-1, :]   # (B, 8, 3) —— indices 0 to 7
-        x_k1 = gt_trajectory[:, 1:,  :]   # (B, 8, 3) —— indices 1 to 8
+        B = keyval.shape[0]
+        device = keyval.device
+        x_1 = gt_trajectory.repeat_interleave(self.num_proposals, dim=0)  # (B, 8, 3)
+        x_0 = torch.randn_like(x_1)  # (B, 8, 3)
+        t = torch.rand(B, 1, 1, device=device)
 
         # 4. 插值得到 z_t
-        z_t = (1 - local_t.unsqueeze(-1)) * x_k + local_t.unsqueeze(-1) * x_k1  # (B, 8, 3)
+        z_t = x_0 + t * (x_1 - x_0)  # (B, 8, 3)
         # z_t = z_t + 0.01 * torch.randn_like(z_t)  # 加噪声
 
         # 5. 真实条件速度场（每段恒定）
-        cvf = (x_k1 - x_k) / delta_t  # (B, 8, 3)
+        cvf = (x_1 - x_0)  # (B, 8, 3)
 
         # 6. 模型预测 dit
-        v_t, _ = self.mfdit(z_t, global_t, kv)
+        v_t = self.mfdit(z_t, t, keyval)
 
         return F.mse_loss(v_t, cvf)
 
@@ -115,13 +81,17 @@ class ScoreHead(nn.Module):
         super().__init__()
         self.config = config
         self.num_poses = num_poses
+        self.state_size = config.state_size
         self.num_proposals = config.num_proposals
+
+        self.traj_encoding = nn.Linear(self.state_size, config.tf_d_model)
+        self.traj_pos_embed = nn.Parameter(torch.randn(1, num_poses, config.tf_d_model) * 0.02)
 
         scorer_layer = nn.TransformerDecoderLayer(
             d_model=d_model, nhead=nhead, dim_feedforward=d_ffn, 
             dropout=0.0, batch_first=True
         )
-        self.scorer_refine_attn = nn.TransformerDecoder(scorer_layer, num_layers=nlayers)
+        self.scorer_attn = nn.TransformerDecoder(scorer_layer, num_layers=nlayers)
 
         def build_head(d_in, d_hidden):
             return nn.Sequential(
@@ -160,30 +130,29 @@ class ScoreHead(nn.Module):
         self.weighted_keys = ['time_to_collision_within_bound', 'ego_progress', 'lane_keeping', 
                               'history_comfort', 'extended_comfort']
 
-    def forward(self, trajectories: torch.Tensor, trajectory_feature: torch.Tensor, 
-                kv: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(self, trajectories: torch.Tensor, 
+                keyval: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
         Args:
             trajectories: (B, K, L, 3)
-            trajectory_feature: (B*K, L, D) 来自 FlowHead
             kv: (B, N, D)
         Returns:
             Dictionary containing best trajectory, scores, and detailed head outputs.
         """
         B, K, L, _ = trajectories.shape
         device = trajectories.device
-        
-        # 1. 扩展 KV
-        kv_expanded = kv.repeat_interleave(K, dim=0) # (B*K, N, D)
-        
-        # 2. 二次环境查询 (Refine) & 池化
-        refined_features = self.scorer_refine_attn(tgt=trajectory_feature, memory=kv_expanded)
-        pooled_feat = refined_features.mean(dim=1) # (B*K, D)
+
+        traj_token = self.traj_encoding(trajectories)
+        traj_token_flat = traj_token.view(B * K, L, -1)
+        traj_token_flat = traj_token_flat + self.traj_pos_embed
+
+        # 交叉注意力
+        tr_out = self.scorer_attn(traj_token_flat, keyval) # (B*K, L, D)
 
         # 3. 获取所有头的 Logits (B*K)
         logits = {}
         for name, head in self.heads.items():
-            logits[name] = head(pooled_feat).squeeze(-1)
+            logits[name] = head(tr_out).squeeze(-1)
 
         # --- 4. Log-Domain 计算总分 ---
         
@@ -193,14 +162,14 @@ class ScoreHead(nn.Module):
             x = logits[key]
             # ln(sigmoid(x)) = -softplus(-x)
             log_p = -F.softplus(-x)
-            log_multiplier_sum += log_p
+            log_multiplier_sum += log_p.sum(dim=-1)
         
         # B. Weighted 部分: Log(Sum of Weighted Probs)
         weighted_sum_prob = torch.zeros(B * K, device=device)
         for key in self.weighted_keys:
             x = logits[key]
             p = torch.sigmoid(x)
-            weighted_sum_prob += self.weights[key] * p
+            weighted_sum_prob += self.weights[key] * p.sum(dim=-1)
         
         weighted_sum_prob /= self.sum_weights
         epsilon = 1e-8
@@ -233,7 +202,7 @@ class ScoreHead(nn.Module):
 
         # 6. 选择最佳轨迹
         best_idx = torch.argmax(log_epdms_score, dim=1, keepdim=True) # (B, 1)
-        idx_expanded = best_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, L, 3)
+        idx_expanded = best_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, self.num_poses, self.state_size)
         best_trajectory = torch.gather(trajectories, 1, idx_expanded).squeeze(1)
         
         # 7. 构建返回字典
@@ -258,18 +227,13 @@ class FlowModel(nn.Module):
     def __init__(self, config: FlowConfig):
         super().__init__()
         self._config = config
+        self.num_proposals = config.num_proposals
         self.image_backbone = ImgEncoder(config)
 
         self.scene_embeds = nn.Parameter(torch.randn(1, self._config.num_cams, self._config.num_scene_tokens, self.image_backbone.num_features)*1e-6)
         
-        kv_len = self._config.num_cams * self._config.num_scene_tokens
-        if self._config.use_hist_ego_status:
-            kv_len += self._config.hist_ego_len
-            self.hist_encoding = nn.Linear(config.hist_ego_dim, config.tf_d_model)
-        
-        self._keyval_embedding = nn.Embedding(
-            kv_len, config.tf_d_model
-        )  # 8x8 feature grid + trajectory
+        self.hist_encoding = nn.Linear(config.hist_ego_dim, config.tf_d_model)
+        self.hist_pos_embed = nn.Parameter(torch.randn(1, config.hist_ego_len, config.tf_d_model) * 0.02)
 
         self._trajectory_head = FlowHead(
             num_poses=config.trajectory_sampling.num_poses,
@@ -289,31 +253,29 @@ class FlowModel(nn.Module):
             config=config
         )
 
-    def forward(self, features: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    def forward(self, features: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         # image, bev, agent, traj, score
         camera_feature: torch.Tensor = features["image"]
         status_feature: torch.Tensor = features["ego_status"]
         batch_size = status_feature.shape[0]
 
-        scene_tokens = self.scene_embeds.repeat(batch_size, 1, 1, 1)
+        scene_token = self.scene_embeds.repeat(batch_size, 1, 1, 1)
 
-        img_tokens = self.image_backbone(camera_feature, scene_tokens)
-        # img_tokens = torch.randn(batch_size, 
+        img_token = self.image_backbone(camera_feature, scene_token)
+        # img_token = torch.randn(batch_size, 
         #                         self._config.num_cams * self._config.num_scene_tokens, 
         #                         self._config.tf_d_model)
         
-        if self._config.use_hist_ego_status:
-            ego_token = self.hist_encoding(status_feature)
-            keyval = torch.concatenate([img_tokens, ego_token], dim=1)
+        ego_token = self.hist_encoding(status_feature)
+        ego_token = ego_token + self.hist_pos_embed
 
-        keyval += self._keyval_embedding.weight[None, ...]
-        
-        trajectory_proposals, trajectory_feature = self._trajectory_head(keyval)
+        keyval = torch.cat([img_token, ego_token], dim=1)
+        kv_expanded = keyval.repeat_interleave(self.num_proposals, dim=0)
 
-        output = self._score_head(trajectory_proposals, trajectory_feature, keyval)
+        trajectory = self._trajectory_head(kv_expanded)
 
-        # (batch_size, num_bev_tokens + 4, config.tf_d_model)
-        output['env_kv'] = keyval
+        output = self._score_head(trajectory, kv_expanded)
+        output['env_kv'] = kv_expanded
 
         return output
 

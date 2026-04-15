@@ -53,20 +53,25 @@ class DiTBlock(nn.Module):
         self.mlp = Mlp(
             in_features=dim, hidden_features=mlp_dim, act_layer=approx_gelu, drop=0
         )
-        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim, 9 * dim))
+        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim * 3, 9 * dim))
 
-    def forward(self, x, t, condition):
+    def forward(self, x, t_emb, img_emb, ego_emb):
+        img_global = img_emb.mean(dim=1)  # (B, D)
+        ego_global = ego_emb.mean(dim=1) # (B, D)
+        condition = torch.cat([t_emb, img_global, ego_global], dim=-1)
+
         shift_msa, scale_msa, gate_msa, \
         shift_cross, scale_cross, gate_cross, \
-        shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(t).chunk(9, dim=1)
+        shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(condition).chunk(9, dim=1)
 
         x = x + gate_msa.unsqueeze(1) * self.attn(
             modulate(self.norm1(x), scale_msa, shift_msa)
         )
 
+        kv = torch.cat([img_emb, ego_emb], dim=1)
         cross_out, _ = self.cross_attn(
                 modulate(self.norm_cross(x), scale_cross, shift_cross), 
-                condition, condition
+                kv, kv
             )
         x = x + gate_cross.unsqueeze(1) * cross_out
 
@@ -81,10 +86,14 @@ class FinalLayer(nn.Module):
         super().__init__()
         self.norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.linear = nn.Linear(hidden_size, out_dim)
-        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size))
+        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size * 3, 2 * hidden_size))
 
-    def forward(self, x, t):
-        shift, scale = self.adaLN_modulation(t).chunk(2, dim=-1)
+    def forward(self, x, t_emb, img_emb, ego_emb):
+        img_global = img_emb.mean(dim=1)  # (B, D)
+        traj_global = ego_emb.mean(dim=1) # (B, D)
+        condition = torch.cat([t_emb, img_global, traj_global], dim=-1)
+
+        shift, scale = self.adaLN_modulation(condition).chunk(2, dim=-1)
         x = modulate(self.norm(x), shift, scale)
         x = self.linear(x)
         return x
@@ -140,7 +149,7 @@ class MFDiT(nn.Module):
 
 
     # (zt | t, bev, ego, score)
-    def forward(self, z_t, t, keyval):
+    def forward(self, z_t, t, img_emb, ego_emb):
         """
         z_t: (B, L=8, D=3)
         t: (B, 1, 1)
@@ -154,9 +163,9 @@ class MFDiT(nn.Module):
         x = zt_emb
         # 4. Pass through blocks
         for block in self.blocks:
-            x = block(x, time_emb, keyval)
+            x = block(x, time_emb, img_emb, ego_emb)
 
-        v_t = self.final_layer(x, time_emb)  # (B, 8, 3) ← only one argument!
+        v_t = self.final_layer(x, time_emb, img_emb, ego_emb)  # (B, 8, 3) ← only one argument!
         
         return v_t
 
@@ -170,6 +179,6 @@ if __name__ == "__main__":
     img_token = torch.randn(B, 64, 256)              
     ego_token = torch.randn(B, 4, 256)        
 
-    output = model(z_t, t, img_token)
+    output = model(z_t, t, img_token, ego_token)
     print("Input z_t shape:", z_t.shape)
     print("Output shape:", output[0].shape, output[1].shape)    # Should be (2, 8, 3)

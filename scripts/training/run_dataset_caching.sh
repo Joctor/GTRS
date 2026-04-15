@@ -1,3 +1,5 @@
+# 运行前需要注销flow_agent.py yaml里的worker和metric_cache_path
+
 TRAIN_TEST_SPLIT=navtrain
 agent=flow_agent
 experiment_name=${agent}_${TRAIN_TEST_SPLIT}_dataset_caching
@@ -9,5 +11,5 @@ train_test_split=$TRAIN_TEST_SPLIT \
 agent=$agent \
 experiment_name=$experiment_name \
 cache_path=$CACHE_PATH \
-+pdm_result_path=$pdm_result_path
+agent.config.pdm_result_path=$pdm_result_path
 

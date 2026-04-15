@@ -172,7 +172,7 @@ class FlowTargetBuilder(AbstractTargetBuilder):
         trajectory = torch.tensor(future_traj.poses)
         frame_idx = scene.scene_metadata.num_history_frames - 1
 
-        gt_mult, gt_weighted = self._get_pdm_result(scene.frames[frame_idx].token)
+        gt_score = self._get_pdm_result(scene.frames[frame_idx].token)
 
         # annotations = scene.frames[frame_idx].annotations
         # ego_pose = StateSE2(*scene.frames[frame_idx].ego_status.ego_pose)
@@ -182,8 +182,7 @@ class FlowTargetBuilder(AbstractTargetBuilder):
 
         return {
             "trajectory": trajectory,
-            "gt_mult": gt_mult,
-            "gt_weighted": gt_weighted,
+            "gt_score": gt_score,
             # "agent_states": agent_states,
             # "agent_labels": agent_labels,
             # "bev_semantic_map": bev_semantic_map,
@@ -200,8 +199,14 @@ class FlowTargetBuilder(AbstractTargetBuilder):
             
             # 返回与正常情况形状一致的零张量
             # gt_mult shape: (1, 4), gt_weighted shape: (1, 5)
-            return torch.zeros((1, 4), dtype=torch.float32), torch.zeros((1, 5), dtype=torch.float32)
+            return torch.zeros(9, dtype=torch.float32)
         
+        strict_cols = ['no_at_fault_collisions', 'driving_direction_compliance']
+        
+        for col in strict_cols:
+            if col in row_data.columns:
+                row_data.loc[:, col] = row_data[col].replace(0.5, 0.0)
+
         mult_cols = [
         'no_at_fault_collisions',
         'drivable_area_compliance',
@@ -216,26 +221,20 @@ class FlowTargetBuilder(AbstractTargetBuilder):
 
         weighted_cols = [
         'time_to_collision_within_bound',
-        'ego_progress',
         'lane_keeping',
         'history_comfort',
-        'two_frame_extended_comfort'
+        'two_frame_extended_comfort',
+        'ego_progress',
         ]
 
         weighted_data = row_data[weighted_cols].values.astype(np.float32)
-
-        ec_index = weighted_cols.index('two_frame_extended_comfort')
-        
-        # 检查该位置是否为 NaN
-        if np.isnan(weighted_data[0, ec_index]):
-            # 填入预计算的均值
-            weighted_data[0, ec_index] = 0
-
         if len(weighted_data) == 0:
             weighted_data = np.zeros((1, 5), dtype=np.float32)
         gt_weighted = torch.from_numpy(weighted_data) # Shape: (N, 5)
 
-        return gt_mult, gt_weighted
+        gt_score = torch.cat([gt_mult, gt_weighted], dim=-1) # Shape: (N, 9)
+
+        return gt_score.squeeze(0) # Shape: (9,)
 
 
     def _compute_agent_targets(self, annotations: Annotations) -> Tuple[torch.Tensor, torch.Tensor]:

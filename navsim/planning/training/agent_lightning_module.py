@@ -110,6 +110,8 @@ class AgentLightningModule(pl.LightningModule):
         
         # 3. 计算 Loss
         if mask.sum() > 0:
+            device = final_ec_pred_logit.device # 获取预测值所在的设备 (GPU)
+            target_col = target_col.to(device) # 确保 tensor_df 在同一设备上
             loss = F.binary_cross_entropy_with_logits(final_ec_pred_logit[mask], target_col[mask])
             # 4. 记录日志 (使用传入的 prefix 区分 train/val)
             self.log(f"{prefix}/pred_ec_loss", loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)

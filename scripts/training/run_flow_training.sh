@@ -13,7 +13,7 @@ pdm_result_path=$NAVSIM_EXP_ROOT/pdm_result.csv
 
 # training hyper-parameters
 lr=0.0002
-bs=26 #96GB
+bs=27 #96GB
 max_epochs=2
 
 MASTER_PORT=29500 MASTER_ADDR=${MASTER_ADDR} WORLD_SIZE=${WORLD_SIZE} NODE_RANK=${NODE_RANK} \

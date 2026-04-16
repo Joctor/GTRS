@@ -186,6 +186,8 @@ class FlowAgent(AbstractAgent):
         # --- 计算 Loss ---
         loss_dict = {}
         total_loss = 0.0
+        device = pred_logits.device # 获取预测值所在的设备 (GPU)
+        tensor_df = tensor_df.to(device) # 确保 tensor_df 在同一设备上
         
         bce_metric = ['nc', 'dac', 'ddc', 'tlc','ttc', 'lk', 'hc']
         for i, name in enumerate(bce_metric):
@@ -225,7 +227,7 @@ class FlowAgent(AbstractAgent):
                                        predictions['img_token'], 
                                        predictions['ego_token'])
         
-        pdm_score_df = self.get_pred_traj_pdm_score(predictions['trajectory'], tokens)
+        pdm_score_df = self.get_pred_traj_pdm_score(predictions['trajectory'].cpu().numpy(), tokens)
 
         gt_score_loss, gt_score_loss_dict = self.get_score_loss(
             'gt',gt_predictions['pred_logits'], targets['gt_score'])

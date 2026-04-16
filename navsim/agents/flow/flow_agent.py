@@ -25,16 +25,13 @@ import pandas as pd
 from navsim.evaluate.pdm_score import pdm_score
 from navsim.common.dataloader import MetricCacheLoader
 from pathlib import Path
-from hydra.utils import instantiate
 from navsim.planning.simulation.planner.pdm_planner.simulation.pdm_simulator import PDMSimulator
 from navsim.planning.simulation.planner.pdm_planner.scoring.pdm_scorer import PDMScorer
 from navsim.traffic_agents_policies.navsim_IDM_traffic_agents import NavsimIDMAgents
 from nuplan.planning.utils.multithreading.worker_utils import worker_map
-from navsim.planning.script.builders.worker_pool_builder import build_worker
 from navsim.common.dataclasses import PDMResults
 from nuplan.common.actor_state.state_representation import StateSE2
 from nuplan.common.geometry.convert import relative_to_absolute_poses
-from navsim.planning.script.run_pdm_score_one_stage import infer_start_adjacent_mapping, create_scene_aggregators
 from functools import partial
 from navsim.common.dataclasses import Trajectory
 
@@ -181,30 +178,9 @@ class FlowAgent(AbstractAgent):
         
         pdm_score_df = pd.concat(score_rows)
 
-        num_sucessful_scenarios = pdm_score_df["valid"].sum()
-        num_failed_scenarios = len(pdm_score_df) - num_sucessful_scenarios
-        logger.info(
-        f"""
-        Finished running evaluation.
-            Number of successful scenarios: {num_sucessful_scenarios}.
-            Number of failed scenarios: {num_failed_scenarios}.
-        """)
-
-        start_adjacent_mapping = infer_start_adjacent_mapping(pdm_score_df)
-        pdm_score_df = create_scene_aggregators(
-            start_adjacent_mapping, pdm_score_df, instantiate(self.simulator.proposal_sampling)
-        )
-
-        score_cols = [
-        'no_at_fault_collisions','drivable_area_compliance','driving_direction_compliance','traffic_light_compliance',
-        'time_to_collision_within_bound','lane_keeping','history_comfort','two_frame_extended_comfort','ego_progress']
-
         pdm_score_df.set_index('token', inplace=True)
-        sorted_df = pdm_score_df.loc[tokens, score_cols]
 
-        tensor_df = torch.from_numpy(sorted_df.values).float()  # (B, 9)
-
-        return tensor_df
+        return pdm_score_df
     
     def get_score_loss(self, mode, pred_logits, tensor_df):
         # --- 计算 Loss ---
@@ -218,14 +194,15 @@ class FlowAgent(AbstractAgent):
             total_loss += loss
         
         # ec
-        pred_col = pred_logits[:, -2]
-        target_col = tensor_df[:, -2]
-        # 创建掩码：非空值为 True
-        mask = ~torch.isnan(target_col)
-        if mask.sum() > 0:  # 确保至少有一个有效值
-            loss = F.binary_cross_entropy_with_logits(pred_col[mask], target_col[mask])
-            loss_dict[f'{mode}_ec_loss'] = loss.item()
-            total_loss += loss
+        if mode == 'gt':
+            pred_col = pred_logits[:, -2]
+            target_col = tensor_df[:, -2]
+            # 创建掩码：非空值为 True
+            mask = ~torch.isnan(target_col)
+            if mask.sum() > 0:  # 确保至少有一个有效值
+                loss = F.binary_cross_entropy_with_logits(pred_col[mask], target_col[mask])
+                loss_dict[f'{mode}_ec_loss'] = loss.item()
+                total_loss += loss
 
         # ep
         loss = F.mse_loss(pred_logits[:, -1], tensor_df[:, -1])
@@ -248,13 +225,23 @@ class FlowAgent(AbstractAgent):
                                        predictions['img_token'], 
                                        predictions['ego_token'])
         
-        pred_traj_pdm_score_df = self.get_pred_traj_pdm_score(predictions['trajectory'], tokens)
+        pdm_score_df = self.get_pred_traj_pdm_score(predictions['trajectory'], tokens)
 
         gt_score_loss, gt_score_loss_dict = self.get_score_loss(
             'gt',gt_predictions['pred_logits'], targets['gt_score'])
         
+        # pred ec 全局计算
+        score_cols = [
+        'no_at_fault_collisions','drivable_area_compliance','driving_direction_compliance','traffic_light_compliance',
+        'time_to_collision_within_bound','lane_keeping','history_comfort','ego_progress']
+
+        sorted_df = pdm_score_df.loc[tokens, score_cols]
+        tensor_df = torch.from_numpy(sorted_df.values).float()  # (B, 8)
+        
         pred_score_loss, pred_score_loss_dict = self.get_score_loss(
-            'pred',predictions['pred_logits'], pred_traj_pdm_score_df)
+            'pred',predictions['pred_logits'], tensor_df)
+        
+        ec_pred_logit = predictions['pred_logits'][:, -2]
         
         # bev_semantic_loss = F.cross_entropy(predictions["bev_semantic_map"], targets["bev_semantic_map"].long())
         
@@ -275,7 +262,7 @@ class FlowAgent(AbstractAgent):
             'pred_score_loss': pred_score_loss.item(),
             **pred_score_loss_dict,
             # 'bev_semantic_loss': bev_semantic_loss
-        }
+        }, pdm_score_df, ec_pred_logit
 
     def get_optimizers(self):
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=self._lr)

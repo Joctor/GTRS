@@ -35,7 +35,9 @@ from navsim.agents.gtrs_dense.hydra_features import state2traj
 from navsim.agents.transfuser.transfuser_agent import TransfuserAgent
 from navsim.common.dataclasses import Trajectory
 from navsim.evaluate.pdm_score import transform_trajectory, get_trajectory_as_array
-
+import pandas as pd
+from navsim.planning.script.run_pdm_score_one_stage import infer_start_adjacent_mapping, create_scene_aggregators
+import torch.nn.functional as F
 
 class AgentLightningModule(pl.LightningModule):
     """Pytorch lightning wrapper for learnable agent."""
@@ -52,6 +54,12 @@ class AgentLightningModule(pl.LightningModule):
         self.combined = combined
         self.agent = agent
 
+        self.training_step_outputs = []
+        self.validation_step_outputs = []
+        
+        self.training_ec_logits = []
+        self.validation_ec_logits = []
+
     def _step(self, batch: Tuple[Dict[str, Tensor], Dict[str, Tensor]], logging_prefix: str) -> Tensor:
         """
         Propagates the model forward and backwards and computes/logs losses and metrics.
@@ -66,7 +74,13 @@ class AgentLightningModule(pl.LightningModule):
         if isinstance(self.agent, TransfuserAgent):
             loss, loss_dict = self.agent.compute_loss(features, targets, prediction)
         elif isinstance(self.agent, FlowAgent):
-            loss, loss_dict = self.agent.compute_loss(features, targets, prediction, tokens)
+            loss, loss_dict, pdm_score_df, ec_pred_logit = self.agent.compute_loss(features, targets, prediction, tokens)
+            if logging_prefix == "train":
+                self.training_step_outputs.append(pdm_score_df)
+                self.training_ec_logits.append(ec_pred_logit)
+            else:
+                self.validation_step_outputs.append(pdm_score_df)
+                self.validation_ec_logits.append(ec_pred_logit)
         else:
             loss, loss_dict = self.agent.compute_loss(features, targets, prediction, tokens)
 
@@ -75,6 +89,48 @@ class AgentLightningModule(pl.LightningModule):
 
         self.log(f"{logging_prefix}/loss", loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         return loss
+    
+    def _compute_ec_loss(self, step_outputs, logits_list, prefix):
+        if not step_outputs or not logits_list:
+            return
+        
+        # 1. 数据拼接与处理,reset_index后续要用token
+        final_pdm_score_df = pd.concat(step_outputs).reset_index()
+        final_ec_pred_logit = torch.cat(logits_list, dim=0)
+        
+        # 2. 业务逻辑
+        start_adjacent_mapping = infer_start_adjacent_mapping(final_pdm_score_df)
+        final_pdm_score_df = create_scene_aggregators(
+            start_adjacent_mapping, final_pdm_score_df, self.agent.simulator.proposal_sampling
+        )
+        
+        target_col = final_pdm_score_df['two_frame_extended_comfort']
+        target_col = torch.from_numpy(target_col.values).float()
+        mask = ~torch.isnan(target_col)
+        
+        # 3. 计算 Loss
+        if mask.sum() > 0:
+            loss = F.binary_cross_entropy_with_logits(final_ec_pred_logit[mask], target_col[mask])
+            # 4. 记录日志 (使用传入的 prefix 区分 train/val)
+            self.log(f"{prefix}/pred_ec_loss", loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        
+        step_outputs.clear()
+        logits_list.clear()
+
+    def on_train_epoch_end(self):
+        self._compute_ec_loss(
+            self.training_step_outputs, 
+            self.training_ec_logits, 
+            "train"
+        )
+
+    def on_validation_epoch_end(self):
+        self._compute_ec_loss(
+            self.validation_step_outputs, 
+            self.validation_ec_logits, 
+            "val"
+        )
+
 
     def training_step(self, batch: Tuple[Dict[str, Tensor], Dict[str, Tensor]], batch_idx: int) -> Tensor:
         """

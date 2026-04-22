@@ -45,8 +45,13 @@ class FlowAgent(AbstractAgent):
         self._checkpoint_path = checkpoint_path
         self.model = FlowModel(config)
 
-        self.last_epoch_pdm_result = pd.read_pickle(self._config.last_epoch_pdm_result_path)
-        self.last_epoch_pdm_result.set_index('token', inplace=True)
+        # TODO
+        # self.last_epoch_pdm_result = pd.read_csv(self._config.last_epoch_pdm_result_path)
+        # self.last_epoch_pdm_result.set_index('token', inplace=True)
+        
+        # last_epoch = np.load(f"{os.environ.get('NAVSIM_DEVKIT_ROOT')}/epoch_1.npz")
+        # self.last_epoch_tokens = last_epoch['tokens']
+        # self.last_epoch_pred_logits = last_epoch['pred_logits']
 
     def name(self) -> str:
         """Inherited, see superclass."""
@@ -89,6 +94,8 @@ class FlowAgent(AbstractAgent):
         total_loss = 0.0
         device = pred_logits.device # 获取预测值所在的设备 (GPU)
         tensor_df = tensor_df.to(device) # 确保 tensor_df 在同一设备上
+        tensor_df[:, 0][tensor_df[:, 0] == 0.5] = 0.0
+        tensor_df[:, 2][tensor_df[:, 2] == 0.5] = 0.0
         
         bce_metric = ['nc', 'dac', 'ddc', 'tlc','ttc', 'lk', 'hc']
         for i, name in enumerate(bce_metric):
@@ -127,25 +134,28 @@ class FlowAgent(AbstractAgent):
                                        predictions['ego_token'])
         gt_score_loss, gt_score_loss_dict = self.get_score_loss(
             'gt',gt_predictions['pred_logits'], targets['gt_score'])
-        
-        token_list = list(tokens)
-        traj_series = self.last_epoch_pdm_result.loc[token_list, 'trajectory']
-        traj_numpy = np.stack(traj_series.values) 
-        current_token_df = torch.from_numpy(traj_numpy).float()
-
-        last_epoch_predictions = self.model._score_head.forward(current_token_df, 
-                                       predictions['img_token'], 
-                                       predictions['ego_token']) 
 
         score_cols = [
         'no_at_fault_collisions','drivable_area_compliance','driving_direction_compliance','traffic_light_compliance',
         'time_to_collision_within_bound','lane_keeping','history_comfort','two_frame_extended_comfort','ego_progress']
-
-        sorted_df = self.last_epoch_pdm_result.loc[tokens, score_cols]
-        tensor_df = torch.from_numpy(sorted_df.values).float()  # (B, 9)
         
-        pred_score_loss, pred_score_loss_dict = self.get_score_loss(
-            'pred',last_epoch_predictions['pred_logits'], tensor_df)
+        # TODO
+        # # --- 1. 准备 PDM 结果 (来自CSV) ---
+        # # .loc 会强制 sorted_df 的顺序与 tokens 列表的顺序一致
+        # sorted_df = self.last_epoch_pdm_result.loc[tokens, score_cols]
+        # tensor_df = torch.from_numpy(sorted_df.values).float()  # (B, 9)
+
+        # # --- 2. 准备预测 Logits (来自NPZ) ---
+        # # 创建一个从 token 到其在原始数组中索引的映射
+        # token_to_idx = {t: i for i, t in enumerate(self.last_epoch_tokens)}
+
+        # # 根据当前批次 tokens 的顺序，获取它们在原始数组中的索引
+        # # 这能确保 selected_logits 的顺序被强制调整为与 tokens 列表一致
+        # indices = [token_to_idx[token] for token in tokens]
+        # selected_logits = self.last_epoch_pred_logits[indices] # 顺序现在也与 tokens 一致
+        
+        # pred_score_loss, pred_score_loss_dict = self.get_score_loss(
+        #     'pred',selected_logits, tensor_df)
         
         # bev_semantic_loss = F.cross_entropy(predictions["bev_semantic_map"], targets["bev_semantic_map"].long())
         
@@ -153,8 +163,8 @@ class FlowAgent(AbstractAgent):
         # bev_semantic_loss = bev_semantic_loss * config.bev_loss_weight
         total_loss = (
                 flow_loss +
-                gt_score_loss +
-                pred_score_loss
+                gt_score_loss
+                # pred_score_loss
                 # bev_semantic_loss
         )
         return total_loss, {
@@ -163,8 +173,8 @@ class FlowAgent(AbstractAgent):
             'flow_loss': flow_loss,
             'gt_score_loss': gt_score_loss.item(),
             **gt_score_loss_dict,
-            'pred_score_loss': pred_score_loss.item(),
-            **pred_score_loss_dict,
+            # 'pred_score_loss': pred_score_loss.item(),
+            # **pred_score_loss_dict,
             # 'bev_semantic_loss': bev_semantic_loss
         }
 

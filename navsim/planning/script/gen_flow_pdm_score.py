@@ -29,12 +29,17 @@ from navsim.planning.simulation.planner.pdm_planner.scoring.scene_aggregator imp
 from navsim.planning.simulation.planner.pdm_planner.simulation.pdm_simulator import PDMSimulator
 from navsim.planning.simulation.planner.pdm_planner.utils.pdm_enums import WeightedMetricIndex
 from navsim.traffic_agents_policies.abstract_traffic_agents_policy import AbstractTrafficAgentsPolicy
+from navsim.common.dataclasses import Trajectory
 
 logger = logging.getLogger(__name__)
 
 CONFIG_PATH = "config/pdm_scoring"
 CONFIG_NAME = "default_run_pdm_score"
 
+data = np.load(f"{os.environ.get('NAVSIM_DEVKIT_ROOT')}/epoch_1.npz")
+
+last_epoch_tokens = data['tokens']             # 形状 (N,)
+last_epoch_trajectories = data['trajectories'] # 形状 (N, L, 3)
 
 def run_pdm_score(args: List[Dict[str, Union[List[str], DictConfig]]]) -> List[pd.DataFrame]:
     """
@@ -84,12 +89,15 @@ def run_pdm_score(args: List[Dict[str, Union[List[str], DictConfig]]]) -> List[p
         )
         try:
             metric_cache = metric_cache_loader.get_from_token(token)
-            agent_input = scene_loader.get_agent_input_from_token(token)
-            if agent.requires_scene:
-                scene = scene_loader.get_scene_from_token(token)
-                trajectory = agent.compute_trajectory(agent_input, scene)
-            else:
-                trajectory = agent.compute_trajectory(agent_input)
+            # agent_input = scene_loader.get_agent_input_from_token(token)
+            # if agent.requires_scene:
+            #     scene = scene_loader.get_scene_from_token(token)
+            #     trajectory = agent.compute_trajectory(agent_input, scene)
+            # else:
+            #     trajectory = agent.compute_trajectory(agent_input)
+            mask = (last_epoch_tokens == token)
+            trajectory = Trajectory(last_epoch_trajectories[mask][0],
+                                    TrajectorySampling(time_horizon=4, interval_length=0.5))
 
             score_row, ego_simulated_states = pdm_score(
                 metric_cache=metric_cache,

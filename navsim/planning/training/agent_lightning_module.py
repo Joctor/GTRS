@@ -54,11 +54,7 @@ class AgentLightningModule(pl.LightningModule):
         self.combined = combined
         self.agent = agent
 
-        self.training_step_outputs = []
-        self.validation_step_outputs = []
-        
-        self.training_ec_logits = []
-        self.validation_ec_logits = []
+        self._step_outputs = []
 
     def _step(self, batch: Tuple[Dict[str, Tensor], Dict[str, Tensor]], logging_prefix: str) -> Tensor:
         """
@@ -82,9 +78,13 @@ class AgentLightningModule(pl.LightningModule):
             self.log(f"{logging_prefix}/{k}", v, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
 
         self.log(f"{logging_prefix}/loss", loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
+        
+        self._step_outputs.append({
+            'token': tokens,
+            'trajectory': prediction['trajectory'].detach().cpu().numpy(),
+            'pred_logits': prediction['pred_logits'].detach().cpu().numpy()
+        })
         return loss
-    
-
 
     def training_step(self, batch: Tuple[Dict[str, Tensor], Dict[str, Tensor]], batch_idx: int) -> Tensor:
         """
@@ -103,6 +103,33 @@ class AgentLightningModule(pl.LightningModule):
         :return: scalar loss
         """
         return self._step(batch, "val")
+
+    def on_validation_epoch_end(self) -> None:
+        """
+        Called at the end of the validation epoch to aggregate and save outputs.
+        """
+        all_tokens = []
+        all_trajectories = []
+        all_pred_logits = []
+        
+        for output in self._step_outputs:
+            all_tokens.append(output['token'])
+            all_trajectories.append(output['trajectory'])
+            all_pred_logits.append(output['pred_logits'])
+        
+        epoch_tokens = np.concatenate(all_tokens, axis=0)
+        epoch_trajectories = np.concatenate(all_trajectories, axis=0)
+        epoch_pred_logits = np.concatenate(all_pred_logits, axis=0)
+
+        # --- 在这里执行保存操作 ---
+        np.savez(f"{os.environ.get('NAVSIM_DEVKIT_ROOT')}/epoch_{self.current_epoch}.npz", 
+                tokens=epoch_tokens,
+                trajectories=epoch_trajectories, 
+                pred_logits=epoch_pred_logits)
+
+        self._step_outputs.clear()
+        
+        print(f"Saved outputs for epoch {self.current_epoch}, shape: {epoch_trajectories.shape}")
 
     def configure_optimizers(self):
         """Inherited, see superclass."""

@@ -10,7 +10,7 @@ agent=flow_agent
 cache_path=$NAVSIM_EXP_ROOT/flow_agent_navtrain_dataset_caching/
 metric_cache_path=$NAVSIM_EXP_ROOT/navtrain_metric_cache/
 pdm_result_path=$NAVSIM_EXP_ROOT/pdm_result.csv
-last_epoch_pdm_result_path=$NAVSIM_EXP_ROOT/last_epoch_pdm_result.pkl
+last_epoch_pdm_result_path=$NAVSIM_EXP_ROOT/last_epoch_pdm_result.csv
 
 # training hyper-parameters
 lr=0.0002

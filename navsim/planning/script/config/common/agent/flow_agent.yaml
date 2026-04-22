@@ -27,6 +27,7 @@ config:
   lr_mult_backbone: 1.0
 
   pdm_result_path: ${oc.env:NAVSIM_EXP_ROOT}/pdm_result.csv
+  last_epoch_pdm_result_path: ${oc.env:NAVSIM_EXP_ROOT}/last_epoch_pdm_result.pkl
 
   trajectory_sampling:
     _target_: nuplan.planning.simulation.trajectory.trajectory_sampling.TrajectorySampling
@@ -37,62 +38,3 @@ config:
 
 checkpoint_path: null
 lr: 1e-4
-
-worker: ${worker}
-metric_cache_path: ${metric_cache_path}
-
-scorer: 
-  _target_: navsim.planning.simulation.planner.pdm_planner.scoring.pdm_scorer.PDMScorer
-  _convert_: 'all'
-  proposal_sampling: ${proposal_sampling}
-  config:
-    _target_: navsim.planning.simulation.planner.pdm_planner.scoring.pdm_scorer.PDMScorerConfig
-    _convert_: 'all'
-    # weighted metric weights
-    progress_weight: 5.0
-    ttc_weight: 5.0
-    lane_keeping_weight: 2.0
-    history_comfort_weight: 2.0
-    two_frame_extended_comfort_weight: 2.0
-
-    # thresholds
-    driving_direction_horizon: 1.0  # [s] (driving direction) (nuplan)
-    driving_direction_compliance_threshold: 2.0  # [m] (driving direction) (nuplan)
-    driving_direction_violation_threshold:  6.0  # [m] (driving direction) (nuplan)
-    stopped_speed_threshold: 5e-03  # [m/s] (ttc)
-    future_collision_horizon_window: 1.0  # [s] (ttc)
-    progress_distance_threshold: 5.0  # [m] (progress)
-    lane_keeping_deviation_limit: 0.5  # [m] (lane keeping) (hydraMDP++)
-    lane_keeping_horizon_window: 2.0  # [s] (lane keeping)
-
-    # human_penalty_filter
-    # This filter is used to incorporate the trajectory of the human agent, ensuring that the ego is not penalized when the human agent makes mistakes
-    # now only for driving_direction_compliance
-    human_penalty_filter: True
-
-simulator:
-  _target_: navsim.planning.simulation.planner.pdm_planner.simulation.pdm_simulator.PDMSimulator
-  _convert_: 'all'
-  proposal_sampling: ${proposal_sampling}
-
-reactive_policy: 
-  _target_: navsim.traffic_agents_policies.navsim_IDM_traffic_agents.NavsimIDMTrafficAgents
-  _convert_: all
-
-  future_trajectory_sampling: ${proposal_sampling}
-
-  idm_agents_observation:
-    _target_: navsim.planning.simulation.observation.navsim_idm_agents.NavsimIDMAgents
-    _convert_: 'all'
-    target_velocity: 10         # Desired velocity in free traffic [m/s]
-    min_gap_to_lead_agent: 1.0  # Minimum relative distance to lead vehicle [m]
-    headway_time: 1.5           # Desired time headway. The minimum possible time to the vehicle in front [s]
-    accel_max: 1.0              # maximum acceleration [m/s^2]
-    decel_max: 2.0              # maximum deceleration (positive value) [m/s^2]
-    open_loop_detections_types: [] # ["PEDESTRIAN", "BARRIER", "CZONE_SIGN", "TRAFFIC_CONE", "GENERIC_OBJECT"]  # Open-loop detections to include
-    minimum_path_length: 20     # [m] The minimum path length to maintain
-    planned_trajectory_samples: null # Number of elements to sample for the planned trajectory.
-    planned_trajectory_sample_interval: null # [s] The time interval of sequence to sample from.
-    radius: 100                 # [m] Only agents within this radius around the ego will be simulated.
-    add_open_loop_parked_vehicles: true
-    idm_snap_threshold: 3.0  # [m] The threshold distance to snap agents to the IDM model

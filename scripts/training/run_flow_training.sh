@@ -10,6 +10,7 @@ agent=flow_agent
 cache_path=$NAVSIM_EXP_ROOT/flow_agent_navtrain_dataset_caching/
 metric_cache_path=$NAVSIM_EXP_ROOT/navtrain_metric_cache/
 pdm_result_path=$NAVSIM_EXP_ROOT/pdm_result.csv
+last_epoch_pdm_result_path=$NAVSIM_EXP_ROOT/last_epoch_pdm_result.pkl
 
 # training hyper-parameters
 lr=0.0002
@@ -32,7 +33,8 @@ python $NAVSIM_DEVKIT_ROOT/navsim/planning/script/run_training_dense.py \
     cache_path=$cache_path \
     metric_cache_path=$metric_cache_path \
     agent.config.pdm_result_path=$pdm_result_path \
-
+    agent.config.last_epoch_pdm_result_path=$last_epoch_pdm_result_path
+    
     #+resume_ckpt_path=/root/ckpt/last.ckpt
     # trainer.params.accelerator=cpu
     # trainer.params.num_nodes=${NUM_NODES} \

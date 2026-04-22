@@ -99,6 +99,7 @@ def run_pdm_score(args: List[Dict[str, Union[List[str], DictConfig]]]) -> List[p
                 scorer=scorer,
                 traffic_agents_policy=traffic_agents_policy,
             )
+            score_row['trajectory'] = [trajectory.poses]
             score_row["valid"] = True
             score_row["log_name"] = metric_cache.log_name
             score_row["frame_type"] = metric_cache.scene_type
@@ -295,12 +296,12 @@ def main(cfg: DictConfig) -> None:
     # average_row["valid"] = pdm_score_df["valid"].all()
 
     # append average and pseudo closed loop scores
-    pdm_score_df = pdm_score_df[["token", "valid"] + score_cols]
+    # pdm_score_df = pdm_score_df[["token", "valid"] + score_cols]
     # pdm_score_df.loc[len(pdm_score_df)] = average_row
 
     save_path = Path(cfg.output_dir)
     timestamp = datetime.now().strftime("%Y.%m.%d.%H.%M.%S")
-    pdm_score_df.to_csv(save_path / f"{timestamp}.csv")
+    pdm_score_df.to_pickle(save_path / f"{timestamp}.pkl")
 
     logger.info(
         f"""

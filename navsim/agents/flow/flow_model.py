@@ -9,7 +9,7 @@ from navsim.agents.flow.flow_config import FlowConfig
 from navsim.agents.flow.dit import MFDiT
 
 from .layers.image_encoder.dinov2_lora import ImgEncoder
-
+from navsim.agents.flow.vit import TransformerDecoder, TransformerDecoderScorer
 
 class FlowHead(nn.Module):
     def __init__(self, num_poses: int, 
@@ -27,11 +27,9 @@ class FlowHead(nn.Module):
               hidden_size=d_model, 
               depth=nlayers, 
               num_heads=nhead)
-        
-        self.twinflow_lambda = 0.5 
 
     @torch.no_grad()
-    def forward(self, constant_velocity, img_token, ego_token):
+    def forward(self, img_token, ego_token):
         """
         生成多候选轨迹
         Args:
@@ -41,8 +39,8 @@ class FlowHead(nn.Module):
         Returns:
             trajectories: (B, num_candidates, num_poses, 3)
         """
-        B = constant_velocity.shape[0]
-        device = constant_velocity.device
+        B = img_token.shape[0]
+        device = img_token.device
         K = self.num_proposals
         
         # ==========================================
@@ -50,21 +48,11 @@ class FlowHead(nn.Module):
         # ==========================================
         
         # 1.1 扩展 constant_velocity: (B, num_poses, 3) -> (B, K, num_poses, 3)
-        x_t = constant_velocity.unsqueeze(1).repeat(1, K, 1, 1)
+        x_t = torch.randn(B, K, self.num_poses, self.state_size, device=device) 
         
         # 1.2 扩展条件 Token: (B, L, C) -> (B, K, L, C)
         img_token_expanded = img_token.unsqueeze(1).repeat(1, K, 1, 1)
         ego_token_expanded = ego_token.unsqueeze(1).repeat(1, K, 1, 1)
-
-        # 1.3 生成独立噪声
-        pos_noise_sigma = 1.0
-        yaw_noise_sigma = 0.1
-        noise_pos = torch.randn(B, K, self.num_poses, 2, device=device) * pos_noise_sigma
-        noise_yaw = torch.randn(B, K, self.num_poses, 1, device=device) * yaw_noise_sigma
-        noise = torch.cat([noise_pos, noise_yaw], dim=-1)
-        
-        # 1.4 初始化 x_t
-        x_t = x_t + noise
 
         # ==========================================
         # 2. 维度重塑 (Reshape): (B, K, ...) -> (B*K, ...)
@@ -88,7 +76,13 @@ class FlowHead(nn.Module):
             # 预测速度场
             # 输入形状: (B*K, 8, 3)
             # 输出形状: (B*K, 8, 3)
-            v_t = self.mfdit(x_t, t_val, img_token_flat, ego_token_flat)
+            target_score = torch.ones((B * K, 9), device=device)
+            v_t_cond = self.mfdit(x_t, t_val, img_token_flat, ego_token_flat, target_score)
+
+            zero_score = torch.zeros((B * K, 9), device=device)
+            v_t_uncond = self.mfdit(x_t, t_val, img_token_flat, ego_token_flat, zero_score)
+
+            v_t = v_t_uncond + 2 * (v_t_cond - v_t_uncond)
             
             # 更新轨迹
             x_t = x_t + v_t * dt
@@ -106,106 +100,118 @@ class FlowHead(nn.Module):
         # gt_trajectory: (batch_size, 8, 3)
         img_token = predictions['img_token']
         ego_token = predictions['ego_token']
-        constant_velocity = predictions['constant_velocity']
+        flow_proposal = predictions['flow_proposal']
         gt_trajectory = targets['trajectory'].float()
-
         B = img_token.shape[0]
+        K = flow_proposal.shape[1]
         device = img_token.device
 
-        split_idx = int(B * self.twinflow_lambda)
+        gt_score = targets['gt_score'].float()
+        drop_mask = torch.rand(B, 1) < 0.1 
+        train_pdm_score = torch.where(drop_mask, torch.zeros_like(gt_score), gt_score)
+
+        x_1 = gt_trajectory
+        x_0 = torch.randn(B, self.num_poses, self.state_size, device=device) 
         
-        # 防止 split_idx 为 0 或 B 导致某一部分没数据
-        if split_idx == 0: split_idx = 1
-        if split_idx == B: split_idx = B - 1
-
-        # 数据切片
-        x_real_twin = gt_trajectory[:split_idx]
-        x_const_twin = constant_velocity[:split_idx]
-        img_twin = img_token[:split_idx]
-        ego_twin = ego_token[:split_idx]
+        t = torch.rand(x_0.shape[0], 1, 1, device=device)
+        # 插值
+        z_t = x_0 + t * (x_1 - x_0)
+        # 加噪声 (可选，增加鲁棒性)
+        z_t = z_t + 0.02 * torch.randn_like(z_t)
         
-        x_real_base = gt_trajectory[split_idx:]
-        x_const_base = constant_velocity[split_idx:]
-        img_base = img_token[split_idx:]
-        ego_base = ego_token[split_idx:]
-
-        flow_loss = 0.0
-
-        if x_real_base.shape[0] > 0:
-            x_1 = x_real_base
-            x_0 = x_const_base
-            
-            t = torch.rand(x_0.shape[0], 1, 1, device=device)
-            # 插值
-            z_t = x_0 + t * (x_1 - x_0)
-            # 加噪声 (可选，增加鲁棒性)
-            z_t = z_t + 0.02 * torch.randn_like(z_t)
-            
-            # 目标速度
-            cvf = (x_1 - x_0)
-            
-            # 预测
-            v_t = self.mfdit(z_t, t, img_base, ego_base)
-            
-            flow_loss += F.mse_loss(v_t, cvf)
+        # 目标速度
+        cvf = (x_1 - x_0)
         
-        if x_real_twin.shape[0] > 0:
-            x_1 = x_real_twin
-            x_0 = x_const_twin
-            
-            # --- A. 生成假数据 (Fake Data Generation) ---
-            # 对应公式: x_fake = z - v_theta(z, 0)
-            # 注意：这里我们用 constant_velocity 作为基准噪声/起点
-            z_noise = x_0 # 在这里我们将 constant_velocity 视为噪声源 z
-            
-            # 预测 t=0 时的速度 (从噪声到数据的初始速度)
-            # 时间输入为 0
-            t_zero = torch.zeros(z_noise.shape[0], 1, 1, device=device)
-            v_z = self.mfdit(z_noise, t_zero, img_twin, ego_twin)
-            
-            # 生成假目标: x_fake
-            # 这里减去速度，是因为我们定义速度场是从 x_0 指向 x_1
-            # 如果想反推 x_0 应该长什么样才能一步到 x_1，逻辑类似
-            # 但根据 TwinFlow 论文，是生成一个 "Fake Target"
-            x_fake = z_noise + v_z # 这里符号取决于你的速度场定义，通常是 x_0 + v * dt
-            
-            # --- B. 自对抗损失 (L_adv) ---
-            # 学习从噪声到 x_fake 的路径 (负时间步)
-            t_prime = torch.rand(x_0.shape[0], 1, 1, device=device) # t' ~ U(0,1)
-            
-            # 构造负向轨迹的扰动样本
-            # x_t_fake = (1-t') * z_new + t' * x_fake  (这里简化插值逻辑)
-            x_t_fake = z_noise + t_prime * (x_fake - z_noise) 
-            x_t_fake = x_t_fake + 0.02 * torch.randn_like(x_t_fake) # 加噪
-            
-            # 目标速度: 从 z_noise 到 x_fake
-            v_target_adv = x_fake - z_noise
-            
-            # 模型预测：输入负时间 -t'
-            v_pred_adv = self.mfdit(x_t_fake, -t_prime, img_twin, ego_twin)
-            
-            flow_loss += F.mse_loss(v_pred_adv, v_target_adv)
-            
-            # --- C. 矫正损失 (L_rectify) ---
-            # 匹配正负轨迹的速度
-            # 1. 计算 v_fake (在负轨迹上)
-            v_fake_val = self.mfdit(x_t_fake.detach(), -t_prime, img_twin, ego_twin)
-            
-            # 2. 计算 v_real (在正轨迹上，对应相同的时间点 t')
-            # 注意：这里我们需要构造正向轨迹的对应点，或者复用 x_t_fake 的位置
-            # 为了简化，我们假设在相同的位置比较速度场
-            v_real_val = self.mfdit(x_t_fake.detach(), t_prime, img_twin, ego_twin)
-            
-            # 速度差 Delta v
-            delta_v = v_real_val - v_fake_val
-            
-            # 矫正目标：让 v_z (初始预测) 去逼近 v_z + Delta_v
-            # 这意味着模型要学习修正这个速度差
-            target_rectify = (v_z + delta_v).detach()
-            
-            flow_loss += F.mse_loss(v_z, target_rectify)
+        # 预测
+        v_t = self.mfdit(z_t, t, img_token, ego_token, train_pdm_score)
+        
+        flow_loss = F.mse_loss(v_t, cvf)
 
-            return flow_loss
+        dist_matrix = torch.norm(flow_proposal.unsqueeze(2) - flow_proposal.unsqueeze(1), dim=-1).sum(dim=-1)
+        mask = torch.triu(torch.ones(K, K, device=device), diagonal=1)
+        pairwise_penalty = torch.exp(-dist_matrix)
+        diversity_loss = (pairwise_penalty * mask).sum() / (0.5 * K * (K - 1))
+
+        gt_expanded = gt_trajectory.unsqueeze(1)
+        dists = torch.norm(flow_proposal - gt_expanded, dim=-1).sum(dim=-1)
+        mindist_loss = torch.min(dists, dim=1)[0].mean()
+
+        return flow_loss, diversity_loss, mindist_loss
+    
+class TrajHead(nn.Module):
+    def __init__(self, num_poses: int, 
+                 d_ffn: int, d_model: int,
+                 nhead: int, nlayers: int, config: FlowConfig = None
+                 ):
+        super().__init__()
+        self.config = config
+        self.num_poses = num_poses
+        self.state_size = config.state_size
+        self.num_proposals = config.num_proposals
+
+        self.proposal_encoding = nn.Sequential(
+            nn.Linear(config.trajectory_sampling.num_poses * config.state_size, d_ffn),
+            nn.ReLU(),
+            nn.Linear(d_ffn, d_model),
+        )
+        
+        self.traj_decoder = TransformerDecoder(config)
+
+        self.output_layer = nn.ModuleList()
+        for i in range(config.ref_num):
+            self.output_layer.append(
+                nn.Sequential(
+                nn.Linear(d_model, d_ffn),
+                nn.LayerNorm(d_ffn),
+                nn.ReLU(),
+                nn.Linear(d_ffn, d_ffn),
+                nn.LayerNorm(d_ffn),
+                nn.ReLU(),
+                nn.Linear(d_ffn, config.trajectory_sampling.num_poses * config.state_size),
+            )
+            )
+        
+    def forward(self, proposal: torch.Tensor, 
+            img_token) -> Dict[str, torch.Tensor]:
+
+        B, K, L, _ = proposal.shape
+        device = proposal.device
+
+        proposal = proposal.view(B, K, -1)
+        #(B,K,256)
+        proposal_token = self.proposal_encoding(proposal)
+        
+        trout_list = self.traj_decoder(proposal_token, img_token)
+
+        proposal_list = []
+        for i in range(self.config.ref_num):
+            trout = trout_list[i]
+            proposal = self.output_layer[i](trout)
+            proposal = proposal.reshape(B, K, L, -1)
+            proposal_list.append(proposal)
+
+        return proposal_list
+    
+    def get_traj_loss(self, targets, predictions):
+        traj_proposal = predictions['traj_proposal']
+        gt_trajectory = targets['trajectory'].float()
+        B = gt_trajectory.shape[0]
+        K = traj_proposal[0].shape[1]
+        device = gt_trajectory.device
+
+        diversity_loss = 0
+        mindist_loss = 0
+        for traj_i in traj_proposal:
+            dist_matrix = torch.norm(traj_i.unsqueeze(2) - traj_i.unsqueeze(1), dim=-1).sum(dim=-1)
+            mask = torch.triu(torch.ones(K, K, device=device), diagonal=1)
+            pairwise_penalty = torch.exp(-dist_matrix)
+            diversity_loss += (pairwise_penalty * mask).sum() / (0.5 * K * (K - 1))
+
+            gt_expanded = gt_trajectory.unsqueeze(1)
+            dists = torch.norm(traj_i - gt_expanded, dim=-1).sum(dim=-1)
+            mindist_loss += torch.min(dists, dim=1)[0].mean()
+
+        return diversity_loss, mindist_loss
 
 class ScoreHead(nn.Module):
     def __init__(self, num_poses: int, 
@@ -224,11 +230,7 @@ class ScoreHead(nn.Module):
                 nn.Linear(config.tf_d_ffn, config.tf_d_model),
             )
 
-        scorer_layer = nn.TransformerDecoderLayer(
-            d_model=d_model, nhead=nhead, dim_feedforward=d_ffn, 
-            dropout=0.0, batch_first=True
-        )
-        self.scorer_attn = nn.TransformerDecoder(scorer_layer, num_layers=nlayers)
+        self.scorer_attn = TransformerDecoderScorer(config)
 
         def build_head(d_in, d_hidden):
             return nn.Sequential(
@@ -286,7 +288,7 @@ class ScoreHead(nn.Module):
         traj_token = self.traj_encoding(trajectories)
         
         # (B, 64+4, D)
-        keyval = torch.cat([img_token, ego_token], dim=1)
+        keyval = img_token + ego_token[:,-1,:].unsqueeze(1)
 
         # 交叉注意力
         tr_out = self.scorer_attn(traj_token, keyval) # (B, K, D)
@@ -338,7 +340,6 @@ class ScoreHead(nn.Module):
         # 7. 构建返回字典
         result = {
             'trajectory': best_trajectories,                  # (B, L, 3)
-            'all_trajectories': trajectories,               # (B, K, L, 3)
             'log_epdms_score': max_scores,             # (B, 1) 总分
             'pred_logits': pred_logits,                     # (B, 9)
             'best_idx': best_indices                            # (B, 1)
@@ -357,8 +358,17 @@ class FlowModel(nn.Module):
         
         self.hist_encoding = nn.Linear(config.hist_ego_dim, config.tf_d_model)
         self.hist_pos_embed = nn.Parameter(torch.randn(1, config.hist_ego_len, config.tf_d_model) * 0.02)
+        
+        self._flow_head = FlowHead(
+            num_poses=config.trajectory_sampling.num_poses,
+            d_ffn=config.tf_d_ffn,
+            d_model=config.tf_d_model,
+            nhead=config.vadv2_head_nhead,
+            nlayers=config.vadv2_head_nlayers,
+            config=config
+        )
 
-        self._trajectory_head = FlowHead(
+        self._traj_head = TrajHead(
             num_poses=config.trajectory_sampling.num_poses,
             d_ffn=config.tf_d_ffn,
             d_model=config.tf_d_model,
@@ -376,64 +386,11 @@ class FlowModel(nn.Module):
             config=config
         )
 
-    def compute_constant_velocity(self, status_feature: torch.Tensor) -> torch.Tensor:
-        """
-        输入: status_feature (B, 4, 11)
-        输出: Trajectory (包含 (B, num_poses, 3) 的 poses)
-        """
-        device = status_feature.device
-        B = status_feature.shape[0]
-        
-        dt = self._config.trajectory_sampling.interval_length
-        num_poses = self._config.trajectory_sampling.num_poses
-        
-        # 1. 提取当前和上一帧数据
-        status_curr = status_feature[:, -1, :]  # (B, 11)
-        status_prev = status_feature[:, -2, :]  # (B, 11)
-
-        # 2. 提取物理量 (确保在设备上)
-        current_x = status_curr[:, 0]           # (B,)
-        current_y = status_curr[:, 1]           # (B,)
-        current_yaw = status_curr[:, 2]         # (B,)
-        
-        prev_yaw = status_prev[:, 2]            # (B,)
-
-        current_vx = status_curr[:, 3]          # (B,)
-        current_vy = status_curr[:, 4]          # (B,)
-
-        # 3. 计算角速度 (Omega)
-        delta_yaw = current_yaw - prev_yaw
-        
-        # 处理 -pi 到 pi 的跳变 (使用 torch 函数)
-        # 公式: (x + pi) % (2*pi) - pi
-        delta_yaw = (delta_yaw + torch.pi) % (2 * torch.pi) - torch.pi
-        
-        angular_velocity = delta_yaw / dt       # (B,)
-
-        # 4. 向量化生成轨迹 (去掉循环)
-        # 创建时间序列向量: [1*dt, 2*dt, ..., num_poses*dt]
-        # 形状: (num_poses,)
-        time_steps = torch.arange(1, num_poses + 1, device=device) * dt
-        
-        # 利用广播机制计算
-        # current_x 是 (B, 1), time_steps 是 (num_poses,) -> 结果 (B, num_poses)
-        # 我们需要先 unsqueeze 变成 (B, 1) 才能和 (num_poses,) 广播
-        future_x = current_x.unsqueeze(1) + current_vx.unsqueeze(1) * time_steps.unsqueeze(0)
-        future_y = current_y.unsqueeze(1) + current_vy.unsqueeze(1) * time_steps.unsqueeze(0)
-        future_yaw = current_yaw.unsqueeze(1) + angular_velocity.unsqueeze(1) * time_steps.unsqueeze(0)
-        
-        # 5. 堆叠成 (B, num_poses, 3)
-        # stack 最后一个维度
-        poses = torch.stack([future_x, future_y, future_yaw], dim=-1)
-        
-        return poses
-    
     def forward(self, features: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         # image, bev, agent, traj, score
         camera_feature: torch.Tensor = features["image"]
         status_feature: torch.Tensor = features["ego_status"]
         batch_size = status_feature.shape[0]
-        constant_velocity = self.compute_constant_velocity(status_feature)
 
         scene_token = self.scene_embeds.repeat(batch_size, 1, 1, 1)
 
@@ -445,13 +402,20 @@ class FlowModel(nn.Module):
         ego_token = self.hist_encoding(status_feature)
         ego_token = ego_token + self.hist_pos_embed
 
-        trajectory = self._trajectory_head(constant_velocity, img_token, ego_token)
+        #(B,K,8,3)
+        flow_proposal = self._flow_head(img_token, ego_token)
+        #4*(B,K,8,3)
+        traj_proposal = self._traj_head(flow_proposal, img_token)
+        #(B,5*K,8,3)
+        all_proposal = torch.cat([flow_proposal, torch.cat(traj_proposal, dim=1)], dim=1)
 
-        output = self._score_head(trajectory, img_token, ego_token)
+        output = self._score_head(all_proposal, img_token, ego_token)
 
         output['img_token'] = img_token
         output['ego_token'] = ego_token
-        output['constant_velocity'] = constant_velocity
+        
+        output['flow_proposal'] = flow_proposal
+        output['traj_proposal'] = traj_proposal
 
         return output
 

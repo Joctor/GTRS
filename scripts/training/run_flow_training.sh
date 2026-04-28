@@ -10,11 +10,11 @@ agent=flow_agent
 cache_path=$NAVSIM_EXP_ROOT/flow_agent_navtrain_dataset_caching/
 metric_cache_path=$NAVSIM_EXP_ROOT/navtrain_metric_cache/
 pdm_result_path=$NAVSIM_EXP_ROOT/pdm_result.csv
-last_epoch_pdm_result_path=$NAVSIM_EXP_ROOT/last_epoch_pdm_result.csv
+last_epoch_pdm_result_path=$NAVSIM_EXP_ROOT/epoch_2_pdm_result.csv
 
 # training hyper-parameters
 lr=0.0002
-bs=27 #96GB
+bs=26 #96GB
 max_epochs=2
 
 MASTER_PORT=29500 MASTER_ADDR=${MASTER_ADDR} WORLD_SIZE=${WORLD_SIZE} NODE_RANK=${NODE_RANK} \

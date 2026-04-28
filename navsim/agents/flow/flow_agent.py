@@ -45,14 +45,6 @@ class FlowAgent(AbstractAgent):
         self._checkpoint_path = checkpoint_path
         self.model = FlowModel(config)
 
-        # TODO
-        # self.last_epoch_pdm_result = pd.read_csv(self._config.last_epoch_pdm_result_path)
-        # self.last_epoch_pdm_result.set_index('token', inplace=True)
-        
-        # last_epoch = np.load(f"{os.environ.get('NAVSIM_DEVKIT_ROOT')}/epoch_1.npz")
-        # self.last_epoch_tokens = last_epoch['tokens']
-        # self.last_epoch_pred_logits = last_epoch['pred_logits']
-
     def name(self) -> str:
         """Inherited, see superclass."""
         return self.__class__.__name__
@@ -127,7 +119,9 @@ class FlowAgent(AbstractAgent):
             tokens
     ):
 
-        flow_loss = self.model._trajectory_head.get_flow_loss(targets, predictions)
+        flow_loss, flow_diversity_loss, flow_mindist_loss = self.model._flow_head.get_flow_loss(targets, predictions)
+
+        traj_diversity_loss, traj_mindist_loss = self.model._traj_head.get_traj_loss(targets, predictions)
 
         gt_predictions = self.model._score_head.forward(targets['trajectory'].float(), 
                                        predictions['img_token'], 
@@ -135,34 +129,16 @@ class FlowAgent(AbstractAgent):
         gt_score_loss, gt_score_loss_dict = self.get_score_loss(
             'gt',gt_predictions['pred_logits'], targets['gt_score'])
 
-        score_cols = [
-        'no_at_fault_collisions','drivable_area_compliance','driving_direction_compliance','traffic_light_compliance',
-        'time_to_collision_within_bound','lane_keeping','history_comfort','two_frame_extended_comfort','ego_progress']
-        
-        # TODO
-        # # --- 1. 准备 PDM 结果 (来自CSV) ---
-        # # .loc 会强制 sorted_df 的顺序与 tokens 列表的顺序一致
-        # sorted_df = self.last_epoch_pdm_result.loc[tokens, score_cols]
-        # tensor_df = torch.from_numpy(sorted_df.values).float()  # (B, 9)
-
-        # # --- 2. 准备预测 Logits (来自NPZ) ---
-        # # 创建一个从 token 到其在原始数组中索引的映射
-        # token_to_idx = {t: i for i, t in enumerate(self.last_epoch_tokens)}
-
-        # # 根据当前批次 tokens 的顺序，获取它们在原始数组中的索引
-        # # 这能确保 selected_logits 的顺序被强制调整为与 tokens 列表一致
-        # indices = [token_to_idx[token] for token in tokens]
-        # selected_logits = self.last_epoch_pred_logits[indices] # 顺序现在也与 tokens 一致
-        
-        # pred_score_loss, pred_score_loss_dict = self.get_score_loss(
-        #     'pred',selected_logits, tensor_df)
-        
         # bev_semantic_loss = F.cross_entropy(predictions["bev_semantic_map"], targets["bev_semantic_map"].long())
         
         # dp_loss = dp_loss * config.dp_loss_weight
         # bev_semantic_loss = bev_semantic_loss * config.bev_loss_weight
         total_loss = (
                 flow_loss +
+                flow_diversity_loss +
+                flow_mindist_loss +
+                traj_diversity_loss +
+                traj_mindist_loss +
                 gt_score_loss
                 # pred_score_loss
                 # bev_semantic_loss
@@ -171,6 +147,10 @@ class FlowAgent(AbstractAgent):
             'total_loss': total_loss,
             'log_epdms_score':torch.mean(predictions['log_epdms_score']).item(),
             'flow_loss': flow_loss,
+            'flow_diversity_loss': flow_diversity_loss,
+            'flow_mindist_loss': flow_mindist_loss,
+            'traj_diversity_loss': traj_diversity_loss,
+            'traj_mindist_loss': traj_mindist_loss,
             'gt_score_loss': gt_score_loss.item(),
             **gt_score_loss_dict,
             # 'pred_score_loss': pred_score_loss.item(),

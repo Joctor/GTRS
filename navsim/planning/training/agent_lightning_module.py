@@ -104,32 +104,6 @@ class AgentLightningModule(pl.LightningModule):
         """
         return self._step(batch, "val")
 
-    def on_validation_epoch_end(self) -> None:
-        """
-        Called at the end of the validation epoch to aggregate and save outputs.
-        """
-        all_tokens = []
-        all_trajectories = []
-        all_pred_logits = []
-        
-        for output in self._step_outputs:
-            all_tokens.append(output['token'])
-            all_trajectories.append(output['trajectory'])
-            all_pred_logits.append(output['pred_logits'])
-        
-        epoch_tokens = np.concatenate(all_tokens, axis=0)
-        epoch_trajectories = np.concatenate(all_trajectories, axis=0)
-        epoch_pred_logits = np.concatenate(all_pred_logits, axis=0)
-
-        # --- 在这里执行保存操作 ---
-        np.savez(f"{os.environ.get('NAVSIM_DEVKIT_ROOT')}/epoch_{self.current_epoch}.npz", 
-                tokens=epoch_tokens,
-                trajectories=epoch_trajectories, 
-                pred_logits=epoch_pred_logits)
-
-        self._step_outputs.clear()
-        
-        print(f"Saved outputs for epoch {self.current_epoch}, shape: {epoch_trajectories.shape}")
 
     def configure_optimizers(self):
         """Inherited, see superclass."""

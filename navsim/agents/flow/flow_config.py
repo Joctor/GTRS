@@ -19,6 +19,12 @@ class FlowConfig(TransfuserConfig):
     hist_ego_dim = 11
     state_size = 3
 
+    ref_num = 4
+    refiner_num_heads = 1
+    refiner_ls_values = 0
+    proj_drop = 0.1
+    drop_path = 0.2
+
     num_cams = 4
     num_scene_tokens: int = 16
     model_name:str = 'timm/vit_small_patch14_reg4_dinov2.lvd142m'

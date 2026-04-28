@@ -44,21 +44,26 @@ class DiTBlock(nn.Module):
         self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.attn = Attention(dim, num_heads=num_heads, qkv_bias=True, qk_norm=True, norm_layer=nn.LayerNorm)
         
-        self.cross_attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
+        self.global_attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
+        self.local_attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
+
         self.norm_cross = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         
+        self.scene_query = nn.Parameter(torch.randn(1, 1, dim))
+
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         mlp_dim = int(dim * mlp_ratio)
         approx_gelu = lambda: nn.GELU(approximate="tanh")
         self.mlp = Mlp(
             in_features=dim, hidden_features=mlp_dim, act_layer=approx_gelu, drop=0
         )
-        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim * 3, 9 * dim))
+        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim * 4, 9 * dim))
 
-    def forward(self, x, t_emb, img_emb, ego_emb):
-        img_global = img_emb.mean(dim=1)  # (B, D)
-        ego_global = ego_emb.mean(dim=1) # (B, D)
-        condition = torch.cat([t_emb, img_global, ego_global], dim=-1)
+    def forward(self, x, t_emb, img_emb, ego_emb, score_emb):
+        img_global, _ = self.global_attn(self.scene_query.expand(x.shape[0], -1, -1), img_emb, img_emb)
+        img_global = img_global.squeeze(1) # (B, D)
+        ego_current = ego_emb[:, -1, :] # (B, D)
+        condition = torch.cat([t_emb, img_global, ego_current, score_emb], dim=-1)
 
         shift_msa, scale_msa, gate_msa, \
         shift_cross, scale_cross, gate_cross, \
@@ -69,7 +74,7 @@ class DiTBlock(nn.Module):
         )
 
         kv = torch.cat([img_emb, ego_emb], dim=1)
-        cross_out, _ = self.cross_attn(
+        cross_out, _ = self.local_attn(
                 modulate(self.norm_cross(x), scale_cross, shift_cross), 
                 kv, kv
             )
@@ -82,16 +87,20 @@ class DiTBlock(nn.Module):
 
 
 class FinalLayer(nn.Module):
-    def __init__(self, hidden_size, out_dim):
+    def __init__(self, hidden_size, num_heads, out_dim):
         super().__init__()
         self.norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.linear = nn.Linear(hidden_size, out_dim)
-        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size * 3, 2 * hidden_size))
+        self.global_attn = nn.MultiheadAttention(hidden_size, num_heads, batch_first=True)
+        self.scene_query = nn.Parameter(torch.randn(1, 1, hidden_size))
+        
+        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size * 4, 2 * hidden_size))
 
-    def forward(self, x, t_emb, img_emb, ego_emb):
-        img_global = img_emb.mean(dim=1)  # (B, D)
-        traj_global = ego_emb.mean(dim=1) # (B, D)
-        condition = torch.cat([t_emb, img_global, traj_global], dim=-1)
+    def forward(self, x, t_emb, img_emb, ego_emb, score_emb):
+        img_global, _ = self.global_attn(self.scene_query.expand(x.shape[0], -1, -1), img_emb, img_emb)
+        img_global = img_global.squeeze(1) # (B, D)
+        ego_current = ego_emb[:, -1, :] # (B, D)
+        condition = torch.cat([t_emb, img_global, ego_current, score_emb], dim=-1)
 
         shift, scale = self.adaLN_modulation(condition).chunk(2, dim=-1)
         x = modulate(self.norm(x), shift, scale)
@@ -116,11 +125,17 @@ class MFDiT(nn.Module):
         
         self.pos_embed = nn.Parameter(torch.zeros(1, num_poses, hidden_size))
 
+        self.score_embed = nn.Sequential(
+                nn.Linear(9, hidden_size),
+                nn.ReLU(),
+                nn.Linear(hidden_size, hidden_size)
+            )
+
         self.blocks = nn.ModuleList([
             DiTBlock(hidden_size, num_heads) for _ in range(depth)
         ])
 
-        self.final_layer = FinalLayer(hidden_size, input_size)
+        self.final_layer = FinalLayer(hidden_size, num_heads, input_size)
 
         self.initialize_weights()
 
@@ -149,7 +164,7 @@ class MFDiT(nn.Module):
 
 
     # (zt | t, bev, ego, score)
-    def forward(self, z_t, t, img_emb, ego_emb):
+    def forward(self, z_t, t, img_emb, ego_emb, pdmscore):
         """
         z_t: (B, L=8, D=3)
         t: (B, 1, 1)
@@ -159,13 +174,15 @@ class MFDiT(nn.Module):
         zt_emb = self.zt_embed(z_t) + self.pos_embed 
 
         time_emb = self.t_embed(t.squeeze(-1).squeeze(-1))       # (B, 8, H)
+
+        score_emb = self.score_embed(pdmscore)
         
         x = zt_emb
         # 4. Pass through blocks
         for block in self.blocks:
-            x = block(x, time_emb, img_emb, ego_emb)
-
-        v_t = self.final_layer(x, time_emb, img_emb, ego_emb)  # (B, 8, 3) ← only one argument!
+            x = block(x, time_emb, img_emb, ego_emb, score_emb)
+        
+        v_t = self.final_layer(x, time_emb, img_emb, ego_emb, score_emb)  # (B, 8, 3) ← only one argument!
         
         return v_t
 
@@ -177,8 +194,9 @@ if __name__ == "__main__":
     z_t = torch.randn(B, L, D)              
     t = torch.rand(B, 1, 1)                    
     img_token = torch.randn(B, 64, 256)              
-    ego_token = torch.randn(B, 4, 256)        
+    ego_token = torch.randn(B, 4, 256)
+    pdmscore = torch.randn(B, 9)        
 
-    output = model(z_t, t, img_token, ego_token)
+    output = model(z_t, t, img_token, ego_token, pdmscore)
     print("Input z_t shape:", z_t.shape)
     print("Output shape:", output[0].shape, output[1].shape)    # Should be (2, 8, 3)

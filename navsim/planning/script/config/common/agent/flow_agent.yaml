@@ -27,7 +27,7 @@ config:
   lr_mult_backbone: 1.0
 
   pdm_result_path: ${oc.env:NAVSIM_EXP_ROOT}/pdm_result.csv
-  last_epoch_pdm_result_path: ${oc.env:NAVSIM_EXP_ROOT}/last_epoch_pdm_result.pkl
+  last_epoch_pdm_result_path: ${oc.env:NAVSIM_EXP_ROOT}/last_epoch_pdm_result.csv
 
   trajectory_sampling:
     _target_: nuplan.planning.simulation.trajectory.trajectory_sampling.TrajectorySampling

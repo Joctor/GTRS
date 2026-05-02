@@ -37,7 +37,6 @@ class FlowConfig(TransfuserConfig):
     compress_fc: bool = False
 
     pdm_result_path: str = '####################'
-    last_epoch_pdm_result_path: str = '####################'
 
     scheduler: str = 'default'
 

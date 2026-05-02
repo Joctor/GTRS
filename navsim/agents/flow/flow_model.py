@@ -106,10 +106,9 @@ class FlowHead(nn.Module):
         K = flow_proposal.shape[1]
         device = img_token.device
 
-        gt_score = targets['gt_score'].float()
+        gt_score = targets['gt_score'].float().nan_to_num(nan=0.0)
         drop_mask = torch.rand(B, 1) < 0.1 
-        train_pdm_score = torch.where(drop_mask, torch.zeros_like(gt_score), gt_score)
-
+        train_pdm_score = torch.where(drop_mask.to(device), torch.zeros_like(gt_score, device=device), gt_score)
         x_1 = gt_trajectory
         x_0 = torch.randn(B, self.num_poses, self.state_size, device=device) 
         

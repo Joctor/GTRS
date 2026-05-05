@@ -155,9 +155,7 @@ def main(cfg: DictConfig) -> None:
                              callbacks=agent.get_training_callbacks())
     else:
         trainer = pl.Trainer(**cfg.trainer.params,
-                             callbacks=agent.get_training_callbacks(),
-                             strategy=DDPStrategy(static_graph=True,
-                                                  timeout=datetime.timedelta(seconds=3600)))
+                             callbacks=agent.get_training_callbacks())
 
     logger.info("Starting Training")
     trainer.fit(

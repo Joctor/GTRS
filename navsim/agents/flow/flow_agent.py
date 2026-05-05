@@ -62,22 +62,6 @@ def run_pdm_score(data_batch: List[Dict], metric_cache_loader, simulator, scorer
                 scorer=scorer,
                 traffic_agents_policy=reactive_policy,
             )
-            score_row_stage_one["valid"] = True
-            score_row_stage_one["log_name"] = metric_cache.log_name
-            score_row_stage_one["frame_type"] = metric_cache.scene_type
-            score_row_stage_one["start_time"] = metric_cache.timepoint.time_s
-            end_pose = StateSE2(
-                x=trajectory.poses[-1, 0],
-                y=trajectory.poses[-1, 1],
-                heading=trajectory.poses[-1, 2],
-            )
-            absolute_endpoint = relative_to_absolute_poses(metric_cache.ego_state.rear_axle, [end_pose])[0]
-            score_row_stage_one["endpoint_x"] = absolute_endpoint.x
-            score_row_stage_one["endpoint_y"] = absolute_endpoint.y
-            score_row_stage_one["start_point_x"] = metric_cache.ego_state.rear_axle.x
-            score_row_stage_one["start_point_y"] = metric_cache.ego_state.rear_axle.y
-            score_row_stage_one["ego_simulated_states"] = [ego_simulated_states]  # used for two-frames extended comfort
-
         except Exception:
             logger.warning(f"----------- Agent failed for token {token}:")
             traceback.print_exc()
@@ -194,7 +178,7 @@ class FlowAgent(AbstractAgent):
         bce_metric = ['nc', 'dac', 'ddc', 'tlc','ttc', 'lk', 'hc']
         for i, name in enumerate(bce_metric):
             loss = F.binary_cross_entropy_with_logits(pred_logits[:, i], tensor_df[:, i])
-            loss_dict[f'{mode}_{name}_loss'] = loss.item()
+            loss_dict[f'{mode}_{name}_loss'] = loss.float().mean()
             total_loss += loss
         
         if mode == 'gt':
@@ -204,12 +188,12 @@ class FlowAgent(AbstractAgent):
             mask = ~torch.isnan(target_col)
             if mask.sum() > 0:  # 确保至少有一个有效值
                 loss = F.binary_cross_entropy_with_logits(pred_col[mask], target_col[mask])
-                loss_dict[f'{mode}_ec_loss'] = loss.item()
+                loss_dict[f'{mode}_ec_loss'] = loss.float().mean()
                 total_loss += loss
 
         # ep
         loss = F.mse_loss(pred_logits[:, -1], tensor_df[:, -1])
-        loss_dict[f'{mode}_ep_loss'] = loss.item()
+        loss_dict[f'{mode}_ep_loss'] = loss.float().mean()
         total_loss += loss
             
         return total_loss, loss_dict
@@ -260,20 +244,23 @@ class FlowAgent(AbstractAgent):
                 pred_score_loss
                 # bev_semantic_loss
         )
+
+        total_loss = total_loss.float()
+
+        # 构建返回字典
         return total_loss, {
             'total_loss': total_loss,
-            'log_epdms_score':torch.mean(predictions['log_epdms_score']).item(),
-            'flow_loss': flow_loss,
-            'flow_diversity_loss': flow_diversity_loss,
-            'flow_mindist_loss': flow_mindist_loss,
-            'traj_diversity_loss': traj_diversity_loss,
-            'traj_mindist_loss': traj_mindist_loss,
-            'gt_score_loss': gt_score_loss.item(),
+            'log_epdms_score': torch.mean(predictions['log_epdms_score']).float(),
+            'flow_loss': flow_loss.float(),
+            'flow_diversity_loss': flow_diversity_loss.float(),
+            'flow_mindist_loss': flow_mindist_loss.float(),
+            'traj_diversity_loss': traj_diversity_loss.float(),
+            'traj_mindist_loss': traj_mindist_loss.float(),
+            'gt_score_loss': gt_score_loss.float(),
             **gt_score_loss_dict,
-            'pred_score_loss': pred_score_loss.item(),
+            'pred_score_loss': pred_score_loss.float(),
             **pred_score_loss_dict,
-            # 'bev_semantic_loss': bev_semantic_loss
-        }, pdm_score_df, ec_pred_logit
+        }
 
     def get_optimizers(self):
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=self._lr)

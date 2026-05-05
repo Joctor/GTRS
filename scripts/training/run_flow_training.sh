@@ -1,8 +1,3 @@
-NUM_NODES=1
-WORLD_SIZE=1
-MASTER_ADDR=127.0.0.1 # your master node ip
-NODE_RANK=0 # 0 for the master node, 1 and 2 for other sub-nodes
-
 TRAIN_TEST_SPLIT=navtrain
 config="default_training" # this config uses the entire navtrain dataset for training
 experiment_name=train_flow
@@ -16,14 +11,12 @@ lr=0.0002
 bs=27 #96GB
 max_epochs=2
 
-MASTER_PORT=29500 MASTER_ADDR=${MASTER_ADDR} WORLD_SIZE=${WORLD_SIZE} NODE_RANK=${NODE_RANK} \
-python $NAVSIM_DEVKIT_ROOT/navsim/planning/script/run_training_dense.py \
+torchrun --nproc_per_node=gpu $NAVSIM_DEVKIT_ROOT/navsim/planning/script/run_training_dense.py \
     --config-name ${config} \
     agent=${agent} \
     experiment_name=${experiment_name} \
     train_test_split=$TRAIN_TEST_SPLIT \
     dataloader.params.batch_size=${bs} \
-    ~trainer.params.strategy \
     trainer.params.max_epochs=${max_epochs} \
     trainer.params.precision=32 \
     agent.lr=${lr} \
@@ -32,8 +25,8 @@ python $NAVSIM_DEVKIT_ROOT/navsim/planning/script/run_training_dense.py \
     cache_path=$cache_path \
     metric_cache_path=$metric_cache_path \
     agent.config.pdm_result_path=$pdm_result_path \
-    worker.threads_per_node=null \
-    
+    worker.threads_per_node=4 \
+    trainer.params.accelerator=cpu
     #+resume_ckpt_path=/root/ckpt/last.ckpt
     # trainer.params.accelerator=cpu
     # trainer.params.num_nodes=${NUM_NODES} \

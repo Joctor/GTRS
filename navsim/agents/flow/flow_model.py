@@ -28,18 +28,12 @@ class FlowHead(nn.Module):
               hidden_size=d_model, 
               depth=nlayers, 
               num_heads=nhead)
-        
-        self.scorehead = scorehead
 
-    @torch.enable_grad()
-    def forward(self, proposal, img_token, ego_token):
+    def forward(self, proposal, img_token):
         B, K, L, _ = proposal.shape
         device = proposal.device
 
         x_t = proposal.view(B, K, -1)
-
-        if not x_t.requires_grad:
-            x_t.requires_grad_(True)
         
         num_steps = 10 
         dt = 1.0 / num_steps
@@ -56,23 +50,6 @@ class FlowHead(nn.Module):
             v_t_uncond = self.mfdit(x_t, t_val, img_token, zero_score)
 
             v_t = v_t_uncond + 2 * (v_t_cond - v_t_uncond)
-            
-            current_traj = x_t.view(B, K, self.num_poses, -1)
-            
-            all_scores = self.scorehead(current_traj, img_token, ego_token)['all_scores']
-
-            # 3. 计算梯度
-            # 我们希望最大化分数，所以梯度方向是 ascent
-            grad_scores = torch.autograd.grad(
-                outputs=all_scores, 
-                inputs=x_t, 
-                grad_outputs=torch.ones_like(all_scores),
-                create_graph=self.training # 允许高阶导数，保持图
-            )[0]
-
-            # 4. 修正速度
-            # v_guided = v_base + scale * gradient
-            v_t = v_t + 2 * grad_scores
             
             # 更新轨迹
             x_t = x_t + v_t * dt
@@ -109,30 +86,7 @@ class FlowHead(nn.Module):
         
         flow_loss = F.mse_loss(v_t, cvf)
 
-        with torch.enable_grad():
-            # 注意：z_t 是 mfdit 的输入，我们要求分数对输入的梯度
-            traj_for_grad = z_t.clone().detach().requires_grad_(True)
-            
-            # 将 traj_for_grad 还原成 ScoreHead 期待的形状 (B, K, num_poses, state_size)
-            traj_input = traj_for_grad.view(B, K, self.num_poses, self.state_size)
-            
-            all_scores = self.scorehead(traj_input, img_token, ego_token)['all_scores']
-            
-            # 计算分数对轨迹的梯度 (grad_scores)
-            grad_scores = torch.autograd.grad(
-                outputs=all_scores, 
-                inputs=traj_for_grad, 
-                grad_outputs=torch.ones_like(all_scores),
-                create_graph=self.training  # 允许高阶导数，保证梯度能传回 mfdit
-            )[0]
-            
-            v_t_norm = F.normalize(v_t, dim=-1)
-            grad_norm = F.normalize(grad_scores, dim=-1)
-            
-            # 最大化余弦相似度 = 最小化 (1 - 余弦相似度)
-            alignment_loss = (1 - (v_t_norm * grad_norm).sum(dim=-1)).mean()
-
-        return flow_loss, alignment_loss
+        return flow_loss
     
 class TrajHead(nn.Module):
     def __init__(self, num_poses: int, 
@@ -326,8 +280,7 @@ class FlowModel(nn.Module):
             d_model=config.tf_d_model,
             nhead=config.vadv2_head_nhead,
             nlayers=config.vadv2_head_nlayers,
-            config=config,
-            scorehead=self._score_head
+            config=config
         )
 
     def forward(self, features: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -338,10 +291,10 @@ class FlowModel(nn.Module):
 
         scene_token = self.scene_embeds.repeat(batch_size, 1, 1, 1)
 
-        img_token = self.image_backbone(camera_feature, scene_token)
-        # img_token = torch.randn(batch_size, 
-        #                         self._config.num_cams * self._config.num_scene_tokens, 
-        #                         self._config.tf_d_model)
+        #img_token = self.image_backbone(camera_feature, scene_token)
+        img_token = torch.randn(batch_size, 
+                                self._config.num_cams * self._config.num_scene_tokens, 
+                                self._config.tf_d_model)
         
         ego_token = self.hist_encoding(status_feature)[:, None]
         #(B,K,256)
@@ -349,7 +302,7 @@ class FlowModel(nn.Module):
         #(B,K,8,3)
         traj_proposal = self._traj_head(traj_token, img_token).view(batch_size, self.num_proposals, -1, self._config.state_size)
         #(B,K,8,3)
-        flow_proposal = self._flow_head(traj_proposal, img_token, ego_token)
+        flow_proposal = self._flow_head(traj_proposal, img_token)
 
         output = self._score_head(flow_proposal, img_token, ego_token)
 

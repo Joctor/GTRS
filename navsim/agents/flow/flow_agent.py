@@ -225,17 +225,20 @@ class FlowAgent(AbstractAgent):
             # 根据类型选择损失函数
             if loss_type == 'mse':
                 raw_loss = F.mse_loss(pred, target, reduction='none')
+                current_weights = sample_weights
             elif loss_type == 'bce_masked':
                 # 处理 GT 模式下 EC 的 NaN 值
                 mask = ~torch.isnan(target)
                 if mask.sum() == 0: continue # 如果没有有效值则跳过
                 raw_loss = F.binary_cross_entropy_with_logits(pred[mask], target[mask], reduction='none')
+                current_weights = sample_weights[mask]
             else: # 默认 bce
                 raw_loss = F.binary_cross_entropy_with_logits(pred, target, reduction='none')
+                current_weights = sample_weights
 
             # 统一应用样本权重并归一化
-            weighted_loss = raw_loss * sample_weights
-            loss_val = weighted_loss.sum() / sample_weights.sum()
+            weighted_loss = raw_loss * current_weights
+            loss_val = weighted_loss.sum() / current_weights.sum()
 
             # 记录字典并累加总 Loss
             loss_dict[f'{mode}_{name}_loss'] = raw_loss.float().mean()
@@ -265,7 +268,7 @@ class FlowAgent(AbstractAgent):
         gt_score_loss, gt_score_loss_dict = self.get_score_loss(
             'gt',gt_predictions['pred_logits'], targets['gt_score'])
         
-        flow_loss, alignment_loss = self.model._flow_head.get_flow_loss(targets, predictions)
+        flow_loss = self.model._flow_head.get_flow_loss(targets, predictions)
 
         gt_expanded = targets['trajectory'].unsqueeze(1)
         dists = torch.norm(predictions['flow_proposal'] - gt_expanded, dim=-1, p=1).mean(dim=-1)
@@ -279,7 +282,6 @@ class FlowAgent(AbstractAgent):
         # bev_semantic_loss = bev_semantic_loss * config.bev_loss_weight
         total_loss = (
                 flow_loss +
-                alignment_loss +
                 mindist_loss +
                 gt_score_loss +
                 pred_score_loss
@@ -294,7 +296,6 @@ class FlowAgent(AbstractAgent):
             'max_scores': torch.mean(predictions['max_scores']).float(),
             'flow_loss': flow_loss.float(),
             'mindist_loss': mindist_loss.float(),
-            'alignment_loss': alignment_loss.float(),
             'gt_score_loss': gt_score_loss.float(),
             **gt_score_loss_dict,
             'pred_score_loss': pred_score_loss.float(),

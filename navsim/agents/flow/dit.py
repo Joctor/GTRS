@@ -57,13 +57,13 @@ class DiTBlock(nn.Module):
         self.mlp = Mlp(
             in_features=dim, hidden_features=mlp_dim, act_layer=approx_gelu, drop=0
         )
-        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim * 4, 9 * dim))
+        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim * 3, 9 * dim))
 
-    def forward(self, x, t_emb, img_emb, ego_emb, score_emb):
+    def forward(self, x, t_emb, img_emb, score_emb):
         img_global, _ = self.global_attn(self.scene_query.expand(x.shape[0], -1, -1), img_emb, img_emb)
         img_global = img_global.squeeze(1) # (B, D)
-        ego_current = ego_emb[:, -1, :] # (B, D)
-        condition = torch.cat([t_emb, img_global, ego_current, score_emb], dim=-1)
+        
+        condition = torch.cat([t_emb, img_global, score_emb], dim=-1)
 
         shift_msa, scale_msa, gate_msa, \
         shift_cross, scale_cross, gate_cross, \
@@ -73,10 +73,9 @@ class DiTBlock(nn.Module):
             modulate(self.norm1(x), scale_msa, shift_msa)
         )
 
-        kv = torch.cat([img_emb, ego_emb], dim=1)
         cross_out, _ = self.local_attn(
                 modulate(self.norm_cross(x), scale_cross, shift_cross), 
-                kv, kv
+                img_emb, img_emb
             )
         x = x + gate_cross.unsqueeze(1) * cross_out
 
@@ -94,16 +93,15 @@ class FinalLayer(nn.Module):
         self.global_attn = nn.MultiheadAttention(hidden_size, num_heads, batch_first=True)
         self.scene_query = nn.Parameter(torch.randn(1, 1, hidden_size))
         
-        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size * 4, 2 * hidden_size))
+        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size * 3, 2 * hidden_size))
 
-    def forward(self, x, t_emb, img_emb, ego_emb, score_emb):
+    def forward(self, x, t_emb, img_emb, score_emb):
         img_global, _ = self.global_attn(self.scene_query.expand(x.shape[0], -1, -1), img_emb, img_emb)
         img_global = img_global.squeeze(1) # (B, D)
-        ego_current = ego_emb[:, -1, :] # (B, D)
-        condition = torch.cat([t_emb, img_global, ego_current, score_emb], dim=-1)
+        condition = torch.cat([t_emb, img_global, score_emb], dim=-1)
 
         shift, scale = self.adaLN_modulation(condition).chunk(2, dim=-1)
-        x = modulate(self.norm(x), shift, scale)
+        x = modulate(self.norm(x), scale, shift)
         x = self.linear(x)
         return x
 
@@ -164,7 +162,7 @@ class MFDiT(nn.Module):
 
 
     # (zt | t, bev, ego, score)
-    def forward(self, z_t, t, img_emb, ego_emb, pdmscore):
+    def forward(self, z_t, t, img_emb, pdmscore):
         """
         z_t: (B, L=8, D=3)
         t: (B, 1, 1)
@@ -180,23 +178,23 @@ class MFDiT(nn.Module):
         x = zt_emb
         # 4. Pass through blocks
         for block in self.blocks:
-            x = block(x, time_emb, img_emb, ego_emb, score_emb)
+            x = block(x, time_emb, img_emb, score_emb)
         
-        v_t = self.final_layer(x, time_emb, img_emb, ego_emb, score_emb)  # (B, 8, 3) ← only one argument!
+        v_t = self.final_layer(x, time_emb, img_emb, score_emb)  # (B, 8, 3) ← only one argument!
         
         return v_t
 
 
 if __name__ == "__main__":
-    B, L, D = 256, 8, 3
-    model = MFDiT(input_size=D, num_poses=L, hidden_size=256, depth=2, num_heads=4)
+    B, K, D = 128, 64, 24
+    model = MFDiT(input_size=D, num_poses=K, hidden_size=256, depth=2, num_heads=4)
 
-    z_t = torch.randn(B, L, D)              
+    z_t = torch.randn(B, K, D)              
     t = torch.rand(B, 1, 1)                    
-    img_token = torch.randn(B, 64, 256)              
-    ego_token = torch.randn(B, 4, 256)
+    img_token = torch.randn(B, K, 256)              
+    # ego_token = torch.randn(B, 4, 256)
     pdmscore = torch.randn(B, 9)        
 
-    output = model(z_t, t, img_token, ego_token, pdmscore)
+    output = model(z_t, t, img_token, pdmscore)
     print("Input z_t shape:", z_t.shape)
-    print("Output shape:", output[0].shape, output[1].shape)    # Should be (2, 8, 3)
+    print("Output shape:", output.shape)

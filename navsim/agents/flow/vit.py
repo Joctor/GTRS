@@ -127,7 +127,7 @@ class TransformerDecoder(torch.nn.Module):
                 )
             )
         self.layers = torch.nn.ModuleList(_layers)
-        self.return_intermediate = True
+        self.return_intermediate = False
 
 
     def forward(self, x, x_cross):

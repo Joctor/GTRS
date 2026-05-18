@@ -164,9 +164,33 @@ class FlowAgent(AbstractAgent):
 
         pdm_score_df.set_index('token', inplace=True)
 
-        return pdm_score_df
+        score_cols = [
+        'no_at_fault_collisions','drivable_area_compliance','driving_direction_compliance','traffic_light_compliance',
+        'time_to_collision_within_bound','lane_keeping','history_comfort','ego_progress']
+
+        sorted_df = pdm_score_df.loc[tokens, score_cols]
+        tensor_df = torch.from_numpy(sorted_df.values).float()  # (B, 8)
+
+        # 2. 计算样本权重 (Sample Weights)
+        # 检查前 4 项 (乘性因子)，只要有一个为 0，就是坏样本
+        multiplier_metrics = tensor_df[:, :4] 
+        # ~torch.any(... > 0) 等同于 "只要有一个是 0"
+        is_bad_sample = (~torch.any(multiplier_metrics > 0, dim=1)).float()
+        
+        # 动态调整惩罚力度
+        bad_ratio = is_bad_sample.mean().item()
+        if bad_ratio > 0.3:
+            penalty_factor = 3.0   # 坏样本多，温和惩罚
+        elif bad_ratio > 0.1:
+            penalty_factor = 8.0   # 正常情况
+        else:
+            penalty_factor = 20.0  # 坏样本少，严厉挖掘
+            
+        sample_weights = 1.0 + penalty_factor * is_bad_sample
+
+        return tensor_df, sample_weights
     
-    def get_score_loss(self, mode, pred_logits, tensor_df):
+    def get_score_loss(self, mode, pred_logits, tensor_df, sample_weights=None):
         # --- 计算 Loss ---
         loss_dict = {}
         total_loss = 0.0
@@ -175,27 +199,48 @@ class FlowAgent(AbstractAgent):
         tensor_df[:, 0][tensor_df[:, 0] == 0.5] = 0.0
         tensor_df[:, 2][tensor_df[:, 2] == 0.5] = 0.0
         
-        bce_metric = ['nc', 'dac', 'ddc', 'tlc','ttc', 'lk', 'hc']
-        for i, name in enumerate(bce_metric):
-            loss = F.binary_cross_entropy_with_logits(pred_logits[:, i], tensor_df[:, i])
-            loss_dict[f'{mode}_{name}_loss'] = loss.float().mean()
-            total_loss += loss
+        if sample_weights is None:
+            sample_weights = torch.ones(tensor_df.shape[0], device=device)
+        else:
+            sample_weights = sample_weights.to(device)
         
-        if mode == 'gt':
-            pred_col = pred_logits[:, -2]
-            target_col = tensor_df[:, -2]
-            # 创建掩码：非空值为 True
-            mask = ~torch.isnan(target_col)
-            if mask.sum() > 0:  # 确保至少有一个有效值
-                loss = F.binary_cross_entropy_with_logits(pred_col[mask], target_col[mask])
-                loss_dict[f'{mode}_ec_loss'] = loss.float().mean()
-                total_loss += loss
+        metric_configs = [
+            ('nc', 0, 'bce', 20.0), ('dac', 1, 'bce', 20.0),
+            ('ddc', 2, 'bce', 20.0), ('tlc', 3, 'bce', 20.0),
+            ('ttc', 4, 'bce', 1.0), ('lk', 5, 'bce', 1.0),
+            ('hc', 6, 'bce', 1.0), ('ep', -1, 'mse', 1.0)
+        ]
 
-        # ep
-        loss = F.mse_loss(pred_logits[:, -1], tensor_df[:, -1])
-        loss_dict[f'{mode}_ep_loss'] = loss.float().mean()
-        total_loss += loss
-            
+        # GT 模式下的特殊处理：EC 指标需要掩码过滤 NaN
+        if mode == 'gt':
+            metric_configs.append(('ec', -2, 'bce_masked', 1.0))
+
+        # ==========================================
+        # 统一循环计算 Loss
+        # ==========================================
+        for name, idx, loss_type, weight in metric_configs:
+            pred = pred_logits[:, idx]
+            target = tensor_df[:, idx]
+
+            # 根据类型选择损失函数
+            if loss_type == 'mse':
+                raw_loss = F.mse_loss(pred, target, reduction='none')
+            elif loss_type == 'bce_masked':
+                # 处理 GT 模式下 EC 的 NaN 值
+                mask = ~torch.isnan(target)
+                if mask.sum() == 0: continue # 如果没有有效值则跳过
+                raw_loss = F.binary_cross_entropy_with_logits(pred[mask], target[mask], reduction='none')
+            else: # 默认 bce
+                raw_loss = F.binary_cross_entropy_with_logits(pred, target, reduction='none')
+
+            # 统一应用样本权重并归一化
+            weighted_loss = raw_loss * sample_weights
+            loss_val = weighted_loss.sum() / sample_weights.sum()
+
+            # 记录字典并累加总 Loss
+            loss_dict[f'{mode}_{name}_loss'] = raw_loss.float().mean()
+            total_loss += weight * loss_val
+
         return total_loss, loss_dict
 
     def compute_loss(
@@ -205,10 +250,14 @@ class FlowAgent(AbstractAgent):
             predictions: Dict[str, torch.Tensor],
             tokens
     ):
+        tensor_df, sample_weights = self.get_pred_traj_pdm_score(predictions['trajectory'].detach().cpu().numpy(), tokens)
         
-        flow_loss, flow_diversity_loss, flow_mindist_loss = self.model._flow_head.get_flow_loss(targets, predictions)
-
-        traj_diversity_loss, traj_mindist_loss = self.model._traj_head.get_traj_loss(targets, predictions)
+        pred_score_loss, pred_score_loss_dict = self.get_score_loss(
+            'pred', 
+            predictions['pred_logits'], 
+            tensor_df, 
+            sample_weights=sample_weights
+        )
 
         gt_predictions = self.model._score_head.forward(targets['trajectory'].float(), 
                                        predictions['img_token'], 
@@ -216,19 +265,13 @@ class FlowAgent(AbstractAgent):
         gt_score_loss, gt_score_loss_dict = self.get_score_loss(
             'gt',gt_predictions['pred_logits'], targets['gt_score'])
         
-        pdm_score_df = self.get_pred_traj_pdm_score(predictions['trajectory'].detach().cpu().numpy(), tokens)
-        
-        score_cols = [
-        'no_at_fault_collisions','drivable_area_compliance','driving_direction_compliance','traffic_light_compliance',
-        'time_to_collision_within_bound','lane_keeping','history_comfort','ego_progress']
+        flow_loss, alignment_loss = self.model._flow_head.get_flow_loss(targets, predictions)
 
-        sorted_df = pdm_score_df.loc[tokens, score_cols]
-        tensor_df = torch.from_numpy(sorted_df.values).float()  # (B, 8)
+        gt_expanded = targets['trajectory'].unsqueeze(1)
+        dists = torch.norm(predictions['flow_proposal'] - gt_expanded, dim=-1, p=1).mean(dim=-1)
+        mindist_loss = torch.min(dists, dim=1)[0].mean()
         
-        pred_score_loss, pred_score_loss_dict = self.get_score_loss(
-            'pred',predictions['pred_logits'], tensor_df)
-        
-        ec_pred_logit = predictions['pred_logits'][:, -2]
+        # ec_pred_logit = predictions['pred_logits'][:, -2]
 
         # bev_semantic_loss = F.cross_entropy(predictions["bev_semantic_map"], targets["bev_semantic_map"].long())
         
@@ -236,10 +279,8 @@ class FlowAgent(AbstractAgent):
         # bev_semantic_loss = bev_semantic_loss * config.bev_loss_weight
         total_loss = (
                 flow_loss +
-                flow_diversity_loss +
-                flow_mindist_loss +
-                traj_diversity_loss +
-                traj_mindist_loss +
+                alignment_loss +
+                mindist_loss +
                 gt_score_loss +
                 pred_score_loss
                 # bev_semantic_loss
@@ -250,12 +291,10 @@ class FlowAgent(AbstractAgent):
         # 构建返回字典
         return total_loss, {
             'total_loss': total_loss,
-            'log_epdms_score': torch.mean(predictions['log_epdms_score']).float(),
+            'max_scores': torch.mean(predictions['max_scores']).float(),
             'flow_loss': flow_loss.float(),
-            'flow_diversity_loss': flow_diversity_loss.float(),
-            'flow_mindist_loss': flow_mindist_loss.float(),
-            'traj_diversity_loss': traj_diversity_loss.float(),
-            'traj_mindist_loss': traj_mindist_loss.float(),
+            'mindist_loss': mindist_loss.float(),
+            'alignment_loss': alignment_loss.float(),
             'gt_score_loss': gt_score_loss.float(),
             **gt_score_loss_dict,
             'pred_score_loss': pred_score_loss.float(),
@@ -296,9 +335,9 @@ class FlowAgent(AbstractAgent):
         ckpt_callback_best = ModelCheckpoint(
             save_top_k=1,
             save_last=True,
-            monitor="val/total_loss",
+            monitor="val/max_scores",
             mode="max",
-            dirpath=f"{os.environ.get('NAVSIM_EXP_ROOT')}/{self._config.ckpt_path}/",
+            dirpath=f"/root/ckpt/",
             filename="best-{epoch:02d}-{step:04d}"
         )
 

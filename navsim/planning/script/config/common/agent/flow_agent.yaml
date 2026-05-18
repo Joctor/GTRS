@@ -9,7 +9,7 @@ config:
   lidar_seq_len: 4
   sigma: 0.5
   trajectory_imi_weight: 1.0
-  num_proposals: 16
+  num_proposals: 64
 
   use_back_view: True
   fusion_layers: 3

@@ -291,10 +291,10 @@ class FlowModel(nn.Module):
 
         scene_token = self.scene_embeds.repeat(batch_size, 1, 1, 1)
 
-        #img_token = self.image_backbone(camera_feature, scene_token)
-        img_token = torch.randn(batch_size, 
-                                self._config.num_cams * self._config.num_scene_tokens, 
-                                self._config.tf_d_model)
+        img_token = self.image_backbone(camera_feature, scene_token)
+        # img_token = torch.randn(batch_size, 
+        #                         self._config.num_cams * self._config.num_scene_tokens, 
+        #                         self._config.tf_d_model)
         
         ego_token = self.hist_encoding(status_feature)[:, None]
         #(B,K,256)

@@ -16,8 +16,8 @@ class FlowConfig(TransfuserConfig):
     num_proposals: int = 64
     use_hist_ego_status: bool = True
     hist_ego_len = 4
-    hist_ego_dim = 11
-    state_size = 3
+    hist_ego_dim = 12
+    state_size = 4
 
     ref_num = 4
     refiner_num_heads = 1

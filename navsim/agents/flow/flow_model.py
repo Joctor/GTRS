@@ -58,15 +58,30 @@ class FlowHead(nn.Module):
         
         return trajectories
     
-    def get_flow_loss(self, targets, predictions):
-        img_token = predictions['img_token']
-        ego_token = predictions['ego_token']
-        traj_proposal = predictions['traj_proposal']
-        gt_trajectory = targets['trajectory'].float()
-        B, K, L, _ = traj_proposal.shape
-        device = img_token.device
+    def get_flow_loss(self, targets, predictions, good_mask=None, tensor_df=None):
+        if good_mask is None:
+            img_token = predictions['img_token']
+            device = img_token.device
+            traj_proposal = predictions['traj_proposal']
+            gt_trajectory = targets['trajectory'].float()
+            gt_score = targets['gt_score'].float().nan_to_num(nan=0.0)
+        else:
+            img_token = predictions['img_token'][good_mask]
+            device = img_token.device
+            traj_proposal = predictions['traj_proposal'][good_mask]
+            gt_trajectory = predictions['trajectory'][good_mask]
 
-        gt_score = targets['gt_score'].float().nan_to_num(nan=0.0)
+            gt_score = tensor_df[good_mask]
+            zero_col = torch.zeros(gt_score.shape[0], 1, device=device, dtype=gt_score.dtype)
+            gt_score = torch.cat([gt_score[:, :-1], zero_col, gt_score[:, -1:]], dim=1)
+        
+        B, K, L, _ = traj_proposal.shape
+
+        heading = gt_trajectory[..., -1:] 
+        sin_heading = torch.sin(heading)
+        cos_heading = torch.cos(heading)
+        gt_trajectory = torch.cat([gt_trajectory[..., :2],sin_heading,cos_heading], dim=-1).unsqueeze(1)
+        
         drop_mask = torch.rand(B, 1) < 0.1 
         train_pdm_score = torch.where(drop_mask.to(device), torch.zeros_like(gt_score, device=device), gt_score)
         x_1 = gt_trajectory.view(B, 1, -1)
@@ -177,9 +192,6 @@ class ScoreHead(nn.Module):
 
     def forward(self, trajectories: torch.Tensor, 
                 img_token, ego_token) -> Dict[str, torch.Tensor]:
-        # GT轨迹进来的变换
-        if len(trajectories.shape) == 3:
-            trajectories = trajectories.unsqueeze(1)  # (B, 1, L, 3)
         
         B, K, L, _ = trajectories.shape
         device = trajectories.device
@@ -228,7 +240,12 @@ class ScoreHead(nn.Module):
 
         # 3. 提取最佳轨迹和所有对应的 logit 分数
         # 使用 best_indices 从 K 个候选中选出每个 batch 最佳的那个
-        best_trajectories = trajectories.view(B, K, L, 3)[batch_indices, best_indices] # (B, L, 3)
+        best_trajectories = trajectories.view(B, K, L, -1)[batch_indices, best_indices] # (B, L, 4)
+
+        sin_h = best_trajectories[..., 2:3]
+        cos_h = best_trajectories[..., 3:4]
+        restored_heading = torch.atan2(sin_h, cos_h) 
+        best_trajectories = torch.cat([best_trajectories[..., :2], restored_heading], dim=-1)
 
         pred_logits = torch.stack(
             [logits[name][batch_indices, best_indices] for name in logits], dim=1)
@@ -287,6 +304,12 @@ class FlowModel(nn.Module):
         # image, bev, agent, traj, score
         camera_feature: torch.Tensor = features["image"]
         status_feature: torch.Tensor = features["ego_status"][:, -1]
+        
+        heading = status_feature[..., 2:3]
+        sin_heading = torch.sin(heading)
+        cos_heading = torch.cos(heading)
+        status_feature = torch.cat([status_feature[..., :2], sin_heading, cos_heading, status_feature[..., 3:]], dim=-1)
+        
         batch_size = status_feature.shape[0]
 
         scene_token = self.scene_embeds.repeat(batch_size, 1, 1, 1)

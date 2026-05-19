@@ -188,7 +188,9 @@ class FlowAgent(AbstractAgent):
             
         sample_weights = 1.0 + penalty_factor * is_bad_sample
 
-        return tensor_df, sample_weights
+        good_mask = torch.all(tensor_df[:, :len(score_cols)] > 0.5, dim=1)
+
+        return tensor_df, sample_weights, good_mask
     
     def get_score_loss(self, mode, pred_logits, tensor_df, sample_weights=None):
         # --- 计算 Loss ---
@@ -253,7 +255,7 @@ class FlowAgent(AbstractAgent):
             predictions: Dict[str, torch.Tensor],
             tokens
     ):
-        tensor_df, sample_weights = self.get_pred_traj_pdm_score(predictions['trajectory'].detach().cpu().numpy(), tokens)
+        tensor_df, sample_weights, good_mask = self.get_pred_traj_pdm_score(predictions['trajectory'].detach().cpu().numpy(), tokens)
         
         pred_score_loss, pred_score_loss_dict = self.get_score_loss(
             'pred', 
@@ -262,7 +264,14 @@ class FlowAgent(AbstractAgent):
             sample_weights=sample_weights
         )
 
-        gt_predictions = self.model._score_head.forward(targets['trajectory'].float(), 
+        gt_traj = targets['trajectory'].float()
+        heading = gt_traj[..., -1:] 
+        sin_heading = torch.sin(heading)
+        cos_heading = torch.cos(heading)
+        #(B,1,8,4)
+        gt_traj = torch.cat([gt_traj[..., :2],sin_heading,cos_heading], dim=-1).unsqueeze(1)
+
+        gt_predictions = self.model._score_head.forward(gt_traj, 
                                        predictions['img_token'], 
                                        predictions['ego_token'])
         gt_score_loss, gt_score_loss_dict = self.get_score_loss(
@@ -270,8 +279,10 @@ class FlowAgent(AbstractAgent):
         
         flow_loss = self.model._flow_head.get_flow_loss(targets, predictions)
 
-        gt_expanded = targets['trajectory'].unsqueeze(1)
-        dists = torch.norm(predictions['flow_proposal'] - gt_expanded, dim=-1, p=1).mean(dim=-1)
+        if torch.any(good_mask):
+            flow_loss += self.model._flow_head.get_flow_loss(targets, predictions, good_mask, tensor_df)
+
+        dists = torch.norm(predictions['flow_proposal'] - gt_traj, dim=-1, p=1).mean(dim=-1)
         mindist_loss = torch.min(dists, dim=1)[0].mean()
         
         # ec_pred_logit = predictions['pred_logits'][:, -2]

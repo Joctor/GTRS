@@ -44,12 +44,8 @@ class DiTBlock(nn.Module):
         self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.attn = Attention(dim, num_heads=num_heads, qkv_bias=True, qk_norm=True, norm_layer=nn.LayerNorm)
         
-        self.global_attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
         self.local_attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
-
         self.norm_cross = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
-        
-        self.scene_query = nn.Parameter(torch.randn(1, 1, dim))
 
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         mlp_dim = int(dim * mlp_ratio)
@@ -57,14 +53,9 @@ class DiTBlock(nn.Module):
         self.mlp = Mlp(
             in_features=dim, hidden_features=mlp_dim, act_layer=approx_gelu, drop=0
         )
-        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim * 3, 9 * dim))
+        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim * 4, 9 * dim))
 
-    def forward(self, x, t_emb, img_emb, score_emb):
-        img_global, _ = self.global_attn(self.scene_query.expand(x.shape[0], -1, -1), img_emb, img_emb)
-        img_global = img_global.squeeze(1) # (B, D)
-        
-        condition = torch.cat([t_emb, img_global, score_emb], dim=-1)
-
+    def forward(self, x, condition, kv):
         shift_msa, scale_msa, gate_msa, \
         shift_cross, scale_cross, gate_cross, \
         shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(condition).chunk(9, dim=1)
@@ -75,7 +66,7 @@ class DiTBlock(nn.Module):
 
         cross_out, _ = self.local_attn(
                 modulate(self.norm_cross(x), scale_cross, shift_cross), 
-                img_emb, img_emb
+                kv, kv
             )
         x = x + gate_cross.unsqueeze(1) * cross_out
 
@@ -86,20 +77,14 @@ class DiTBlock(nn.Module):
 
 
 class FinalLayer(nn.Module):
-    def __init__(self, hidden_size, num_heads, out_dim):
+    def __init__(self, hidden_size, out_dim):
         super().__init__()
         self.norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.linear = nn.Linear(hidden_size, out_dim)
-        self.global_attn = nn.MultiheadAttention(hidden_size, num_heads, batch_first=True)
-        self.scene_query = nn.Parameter(torch.randn(1, 1, hidden_size))
         
-        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size * 3, 2 * hidden_size))
+        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size * 4, 2 * hidden_size))
 
-    def forward(self, x, t_emb, img_emb, score_emb):
-        img_global, _ = self.global_attn(self.scene_query.expand(x.shape[0], -1, -1), img_emb, img_emb)
-        img_global = img_global.squeeze(1) # (B, D)
-        condition = torch.cat([t_emb, img_global, score_emb], dim=-1)
-
+    def forward(self, x, condition):
         shift, scale = self.adaLN_modulation(condition).chunk(2, dim=-1)
         x = modulate(self.norm(x), scale, shift)
         x = self.linear(x)
@@ -128,12 +113,15 @@ class MFDiT(nn.Module):
                 nn.ReLU(),
                 nn.Linear(hidden_size, hidden_size)
             )
+        
+        self.global_attn = nn.MultiheadAttention(hidden_size, num_heads, batch_first=True)
+        self.scene_query = nn.Parameter(torch.randn(1, 1, hidden_size))
 
         self.blocks = nn.ModuleList([
             DiTBlock(hidden_size, num_heads) for _ in range(depth)
         ])
 
-        self.final_layer = FinalLayer(hidden_size, num_heads, input_size)
+        self.final_layer = FinalLayer(hidden_size, input_size)
 
         self.initialize_weights()
 
@@ -162,7 +150,7 @@ class MFDiT(nn.Module):
 
 
     # (zt | t, bev, ego, score)
-    def forward(self, z_t, t, img_emb, pdmscore):
+    def forward(self, z_t, t, img_emb, ego_emb, pdmscore):
         """
         z_t: (B, L=8, D=3)
         t: (B, 1, 1)
@@ -174,13 +162,20 @@ class MFDiT(nn.Module):
         time_emb = self.t_embed(t.squeeze(-1).squeeze(-1))       # (B, 8, H)
 
         score_emb = self.score_embed(pdmscore)
+
+        img_global, _ = self.global_attn(self.scene_query.expand(B, -1, -1), img_emb, img_emb)
+        img_global = img_global.squeeze(1) # (B, D)
+        ego_current = ego_emb[:, -1, :] # (B, D)
+        condition = torch.cat([time_emb, img_global, ego_current, score_emb], dim=-1)
+
+        kv = torch.cat([img_emb, ego_emb], dim=1)
         
         x = zt_emb
         # 4. Pass through blocks
         for block in self.blocks:
-            x = block(x, time_emb, img_emb, score_emb)
+            x = block(x, condition, kv)
         
-        v_t = self.final_layer(x, time_emb, img_emb, score_emb)  # (B, 8, 3) ← only one argument!
+        v_t = self.final_layer(x, condition)  # (B, 8, 3) ← only one argument!
         
         return v_t
 
@@ -192,9 +187,9 @@ if __name__ == "__main__":
     z_t = torch.randn(B, K, D)              
     t = torch.rand(B, 1, 1)                    
     img_token = torch.randn(B, K, 256)              
-    # ego_token = torch.randn(B, 4, 256)
+    ego_token = torch.randn(B, 4, 256)
     pdmscore = torch.randn(B, 9)        
 
-    output = model(z_t, t, img_token, pdmscore)
+    output = model(z_t, t, img_token, ego_token, pdmscore)
     print("Input z_t shape:", z_t.shape)
     print("Output shape:", output.shape)

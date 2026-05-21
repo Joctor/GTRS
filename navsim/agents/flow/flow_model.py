@@ -29,25 +29,26 @@ class FlowHead(nn.Module):
               depth=nlayers, 
               num_heads=nhead)
 
-    def forward(self, proposal, img_token):
-        B, K, L, _ = proposal.shape
-        device = proposal.device
+    def forward(self, img_token, ego_token):
+        B = img_token.shape[0]
+        device = img_token.device
+        K = self.num_proposals
 
-        x_t = proposal.view(B, K, -1)
+        x_t = torch.randn(B, K, self.num_poses * self.state_size, device=device) 
         
         num_steps = 10 
         dt = 1.0 / num_steps
 
         for i in range(num_steps):
             # 构造时间步 t
-            # 形状必须是 (B*K, 1, 1)，对应合并后的 Batch 维度
+            # 形状必须是 (B, 1, 1)，对应合并后的 Batch 维度
             t_val = torch.full((B, 1, 1), i * dt, device=device)
             
             target_score = torch.ones((B, 9), device=device)
-            v_t_cond = self.mfdit(x_t, t_val, img_token, target_score)
+            v_t_cond = self.mfdit(x_t, t_val, img_token, ego_token, target_score)
 
             zero_score = torch.zeros((B, 9), device=device)
-            v_t_uncond = self.mfdit(x_t, t_val, img_token, zero_score)
+            v_t_uncond = self.mfdit(x_t, t_val, img_token, ego_token, zero_score)
 
             v_t = v_t_uncond + 2 * (v_t_cond - v_t_uncond)
             
@@ -61,43 +62,40 @@ class FlowHead(nn.Module):
     def get_flow_loss(self, targets, predictions, good_mask=None, tensor_df=None):
         if good_mask is None:
             img_token = predictions['img_token']
+            ego_token = predictions['ego_token']
             device = img_token.device
-            traj_proposal = predictions['traj_proposal']
+
             gt_trajectory = targets['trajectory'].float()
             gt_score = targets['gt_score'].float().nan_to_num(nan=0.0)
         else:
             img_token = predictions['img_token'][good_mask]
+            ego_token = predictions['ego_token'][good_mask]
             device = img_token.device
-            traj_proposal = predictions['traj_proposal'][good_mask]
+
             gt_trajectory = predictions['trajectory'][good_mask]
 
             gt_score = tensor_df[good_mask]
             zero_col = torch.zeros(gt_score.shape[0], 1, device=device, dtype=gt_score.dtype)
             gt_score = torch.cat([gt_score[:, :-1], zero_col, gt_score[:, -1:]], dim=1)
         
-        B, K, L, _ = traj_proposal.shape
-
-        heading = gt_trajectory[..., -1:] 
-        sin_heading = torch.sin(heading)
-        cos_heading = torch.cos(heading)
-        gt_trajectory = torch.cat([gt_trajectory[..., :2],sin_heading,cos_heading], dim=-1).unsqueeze(1)
+        B = gt_trajectory.shape[0]
         
         drop_mask = torch.rand(B, 1) < 0.1 
         train_pdm_score = torch.where(drop_mask.to(device), torch.zeros_like(gt_score, device=device), gt_score)
         x_1 = gt_trajectory.view(B, 1, -1)
-        x_0 = traj_proposal.view(B, K, -1)
+        x_0 = torch.randn(B, self.num_proposals, self.num_poses * self.state_size, device=device) 
         
         t = torch.rand(x_0.shape[0], 1, 1, device=device)
         # 插值
         z_t = x_0 + t * (x_1 - x_0)
         # 加噪声 (可选，增加鲁棒性)
-        z_t = z_t + 0.2 * torch.randn_like(z_t)
+        # z_t = z_t + 0.02 * torch.randn_like(z_t)
         
         # 目标速度
         cvf = (x_1 - x_0)
         
         # 预测
-        v_t = self.mfdit(z_t, t, img_token, train_pdm_score)
+        v_t = self.mfdit(z_t, t, img_token, ego_token, train_pdm_score)
         
         flow_loss = F.mse_loss(v_t, cvf)
 
@@ -113,6 +111,12 @@ class TrajHead(nn.Module):
         self.num_poses = num_poses
         self.state_size = config.state_size
         self.num_proposals = config.num_proposals
+
+        self.traj_encoding = nn.Sequential(
+            nn.Linear(num_poses * config.state_size, d_ffn),
+            nn.ReLU(),
+            nn.Linear(d_ffn, d_model),
+        )
         
         self.traj_decoder = TransformerDecoder(config)
 
@@ -123,14 +127,20 @@ class TrajHead(nn.Module):
                 nn.Linear(d_ffn, d_ffn),
                 nn.LayerNorm(d_ffn),
                 nn.ReLU(),
-                nn.Linear(d_ffn, config.trajectory_sampling.num_poses * config.state_size),
+                nn.Linear(d_ffn, self.num_poses * config.state_size),
             )
         
-    def forward(self, traj_token: torch.Tensor, 
+    def forward(self, trajectories: torch.Tensor, 
             img_token) -> Dict[str, torch.Tensor]:
         
+        B, K, L, _ = trajectories.shape
+        device = trajectories.device
+
+        trajectories = trajectories.view(B, K, -1)
+        traj_token = self.traj_encoding(trajectories)
+        
         tr_out = self.traj_decoder(traj_token, img_token)
-        proposal = self.output_layer(tr_out)
+        proposal = self.output_layer(tr_out).view(B, K, L, -1)
 
         return proposal
 
@@ -196,11 +206,11 @@ class ScoreHead(nn.Module):
         B, K, L, _ = trajectories.shape
         device = trajectories.device
 
-        trajectories = trajectories.view(B, K, -1)
+        trajectories = trajectories.detach().view(B, K, -1)
         traj_token = self.traj_encoding(trajectories)
 
         tr_out = self.scorer_attn(traj_token, img_token) # (B, K, D)
-        tr_out = tr_out + ego_token
+        tr_out = tr_out + ego_token[:, -1, :].unsqueeze(1)
         logits = {}
         for name, head in self.heads.items():
             logits[name] = head(tr_out).squeeze(-1)
@@ -240,12 +250,7 @@ class ScoreHead(nn.Module):
 
         # 3. 提取最佳轨迹和所有对应的 logit 分数
         # 使用 best_indices 从 K 个候选中选出每个 batch 最佳的那个
-        best_trajectories = trajectories.view(B, K, L, -1)[batch_indices, best_indices] # (B, L, 4)
-
-        sin_h = best_trajectories[..., 2:3]
-        cos_h = best_trajectories[..., 3:4]
-        restored_heading = torch.atan2(sin_h, cos_h) 
-        best_trajectories = torch.cat([best_trajectories[..., :2], restored_heading], dim=-1)
+        best_trajectories = trajectories.view(B, K, L, -1)[batch_indices, best_indices] # (B, L, 3)
 
         pred_logits = torch.stack(
             [logits[name][batch_indices, best_indices] for name in logits], dim=1)
@@ -271,7 +276,7 @@ class FlowModel(nn.Module):
         self.scene_embeds = nn.Parameter(torch.randn(1, self._config.num_cams, self._config.num_scene_tokens, self.image_backbone.num_features)*1e-6)
         
         self.hist_encoding = nn.Linear(config.hist_ego_dim, config.tf_d_model)
-        self.traj_embed = nn.Embedding(config.num_proposals, config.tf_d_model)
+        self.hist_pos_embed = nn.Parameter(torch.randn(1, config.hist_ego_len, config.tf_d_model) * 0.02)
 
         self._traj_head = TrajHead(
             num_poses=config.trajectory_sampling.num_poses,
@@ -303,12 +308,7 @@ class FlowModel(nn.Module):
     def forward(self, features: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         # image, bev, agent, traj, score
         camera_feature: torch.Tensor = features["image"]
-        status_feature: torch.Tensor = features["ego_status"][:, -1]
-        
-        heading = status_feature[..., 2:3]
-        sin_heading = torch.sin(heading)
-        cos_heading = torch.cos(heading)
-        status_feature = torch.cat([status_feature[..., :2], sin_heading, cos_heading, status_feature[..., 3:]], dim=-1)
+        status_feature: torch.Tensor = features["ego_status"]
         
         batch_size = status_feature.shape[0]
 
@@ -319,15 +319,14 @@ class FlowModel(nn.Module):
         #                         self._config.num_cams * self._config.num_scene_tokens, 
         #                         self._config.tf_d_model)
         
-        ego_token = self.hist_encoding(status_feature)[:, None]
-        #(B,K,256)
-        traj_token = self.traj_embed.weight[None] + ego_token
-        #(B,K,8,3)
-        traj_proposal = self._traj_head(traj_token, img_token).view(batch_size, self.num_proposals, -1, self._config.state_size)
-        #(B,K,8,3)
-        flow_proposal = self._flow_head(traj_proposal, img_token)
+        ego_token = self.hist_encoding(status_feature)
+        ego_token = ego_token + self.hist_pos_embed
 
-        output = self._score_head(flow_proposal, img_token, ego_token)
+        flow_proposal = self._flow_head(img_token, ego_token)
+
+        traj_proposal = self._traj_head(flow_proposal, img_token)
+
+        output = self._score_head(traj_proposal, img_token, ego_token)
 
         output['img_token'] = img_token
         output['ego_token'] = ego_token

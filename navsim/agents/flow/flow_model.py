@@ -1,4 +1,4 @@
-import math
+import numpy as np
 from typing import Dict
 
 import torch
@@ -15,7 +15,6 @@ class FlowHead(nn.Module):
     def __init__(self, num_poses: int, 
                  d_ffn: int, d_model: int,
                  nhead: int, nlayers: int, config: FlowConfig = None,
-                 scorehead=None
                  ):
         super().__init__()
         self.config = config
@@ -23,18 +22,22 @@ class FlowHead(nn.Module):
         self.state_size = config.state_size
         self.num_proposals = config.num_proposals
 
-        self.mfdit = MFDiT(input_size=num_poses * config.state_size, 
-              num_poses=config.num_proposals, 
+        self.mfdit = MFDiT(input_size=config.state_size, 
+              num_poses=num_poses, 
               hidden_size=d_model, 
               depth=nlayers, 
               num_heads=nhead)
 
-    def forward(self, img_token, ego_token):
+    def forward(self, img_token, ego_token, weighted_vocab_token):
         B = img_token.shape[0]
         device = img_token.device
         K = self.num_proposals
 
-        x_t = torch.randn(B, K, self.num_poses * self.state_size, device=device) 
+        x_t = torch.randn(B*K, self.num_poses, self.state_size, device=device)
+        
+        img_token_flat = img_token.repeat_interleave(K, dim=0)
+        ego_token_flat = ego_token.repeat_interleave(K, dim=0)
+        weighted_vocab_token_flat = weighted_vocab_token.repeat_interleave(K, dim=0)
         
         num_steps = 10 
         dt = 1.0 / num_steps
@@ -42,13 +45,12 @@ class FlowHead(nn.Module):
         for i in range(num_steps):
             # 构造时间步 t
             # 形状必须是 (B, 1, 1)，对应合并后的 Batch 维度
-            t_val = torch.full((B, 1, 1), i * dt, device=device)
+            t_val = torch.full((B*K, 1, 1), i * dt, device=device)
             
-            target_score = torch.ones((B, 9), device=device)
-            v_t_cond = self.mfdit(x_t, t_val, img_token, ego_token, target_score)
+            v_t_cond = self.mfdit(x_t, t_val, img_token_flat, ego_token_flat, weighted_vocab_token_flat)
 
-            zero_score = torch.zeros((B, 9), device=device)
-            v_t_uncond = self.mfdit(x_t, t_val, img_token, ego_token, zero_score)
+            zeros_token = torch.zeros_like(weighted_vocab_token_flat, device=device)
+            v_t_uncond = self.mfdit(x_t, t_val, img_token_flat, ego_token_flat, zeros_token)
 
             v_t = v_t_uncond + 2 * (v_t_cond - v_t_uncond)
             
@@ -59,31 +61,36 @@ class FlowHead(nn.Module):
         
         return trajectories
     
-    def get_flow_loss(self, targets, predictions, good_mask=None, tensor_df=None):
-        if good_mask is None:
+    def get_flow_loss(self, predictions, gt_traj, vocab_score):
+        B = gt_traj.shape[0]
             img_token = predictions['img_token']
             ego_token = predictions['ego_token']
+        vocab_token = predictions['vocab_token']
             device = img_token.device
 
-            gt_trajectory = targets['trajectory'].float()
-            gt_score = targets['gt_score'].float().nan_to_num(nan=0.0)
-        else:
-            img_token = predictions['img_token'][good_mask]
-            ego_token = predictions['ego_token'][good_mask]
-            device = img_token.device
+        multiplier_logits = vocab_score[..., :4]
+        log_multiplier_sum = -F.softplus(-multiplier_logits).sum(dim=-1) 
 
-            gt_trajectory = predictions['trajectory'][good_mask]
+        weighted_logits = vocab_score[..., 4:]
+        weighted_probs = torch.sigmoid(weighted_logits)
+        # ttc,lk,hc,ep
+        weighted_sum_prob = (weighted_probs * torch.tensor([5.0, 2.0, 2.0, 5.0], device=device)).sum(dim=-1) / 14.0
+        log_weighted_sum = torch.log(weighted_sum_prob.clamp(min=1e-8))
+        
+        combined_score = log_multiplier_sum + log_weighted_sum
+        #(B, K, 1)
+        score_weights = combined_score.softmax(dim=-1).unsqueeze(-1)
+        #(B, K, D)
+        weighted_vocab_token = vocab_token * score_weights
+        
+        drop_mask = torch.rand(B, 1, 1) < 0.2
+        weighted_vocab_token = torch.where(drop_mask.to(device), 
+                                           torch.zeros_like(weighted_vocab_token, device=device), 
+                                           weighted_vocab_token)
+        
+        x_1 = gt_traj
 
-            gt_score = tensor_df[good_mask]
-            zero_col = torch.zeros(gt_score.shape[0], 1, device=device, dtype=gt_score.dtype)
-            gt_score = torch.cat([gt_score[:, :-1], zero_col, gt_score[:, -1:]], dim=1)
-        
-        B = gt_trajectory.shape[0]
-        
-        drop_mask = torch.rand(B, 1) < 0.1 
-        train_pdm_score = torch.where(drop_mask.to(device), torch.zeros_like(gt_score, device=device), gt_score)
-        x_1 = gt_trajectory.view(B, 1, -1)
-        x_0 = torch.randn(B, self.num_proposals, self.num_poses * self.state_size, device=device) 
+        x_0 = torch.randn(B, self.num_poses, self.state_size, device=device)
         
         t = torch.rand(x_0.shape[0], 1, 1, device=device)
         # 插值
@@ -95,13 +102,13 @@ class FlowHead(nn.Module):
         cvf = (x_1 - x_0)
         
         # 预测
-        v_t = self.mfdit(z_t, t, img_token, ego_token, train_pdm_score)
+        v_t = self.mfdit(z_t, t, img_token, ego_token, weighted_vocab_token)
         
         flow_loss = F.mse_loss(v_t, cvf)
 
         return flow_loss
     
-class TrajHead(nn.Module):
+class ScoreHead(nn.Module):
     def __init__(self, num_poses: int, 
                  d_ffn: int, d_model: int,
                  nhead: int, nlayers: int, config: FlowConfig = None
@@ -112,12 +119,6 @@ class TrajHead(nn.Module):
         self.state_size = config.state_size
         self.num_proposals = config.num_proposals
 
-        self.traj_encoding = nn.Sequential(
-            nn.Linear(num_poses * config.state_size, d_ffn),
-            nn.ReLU(),
-            nn.Linear(d_ffn, d_model),
-        )
-        
         self.traj_decoder = TransformerDecoder(config)
 
         self.output_layer = nn.Sequential(
@@ -130,37 +131,6 @@ class TrajHead(nn.Module):
                 nn.Linear(d_ffn, self.num_poses * config.state_size),
             )
         
-    def forward(self, trajectories: torch.Tensor, 
-            img_token) -> Dict[str, torch.Tensor]:
-        
-        B, K, L, _ = trajectories.shape
-        device = trajectories.device
-
-        trajectories = trajectories.view(B, K, -1)
-        traj_token = self.traj_encoding(trajectories)
-        
-        tr_out = self.traj_decoder(traj_token, img_token)
-        proposal = self.output_layer(tr_out).view(B, K, L, -1)
-
-        return proposal
-
-class ScoreHead(nn.Module):
-    def __init__(self, num_poses: int, 
-                 d_ffn: int, d_model: int,
-                 nhead: int, nlayers: int, config: FlowConfig = None
-                 ):
-        super().__init__()
-        self.config = config
-        self.num_poses = num_poses
-        self.state_size = config.state_size
-        self.num_proposals = config.num_proposals
-
-        self.traj_encoding = nn.Sequential(
-            nn.Linear(num_poses * config.state_size, d_ffn),
-            nn.ReLU(),
-            nn.Linear(d_ffn, d_model),
-        )
-
         self.scorer_attn = TransformerDecoderScorer(config)
 
         def build_head(d_in, d_hidden):
@@ -181,7 +151,7 @@ class ScoreHead(nn.Module):
             'time_to_collision_within_bound': build_head(d_model, d_ffn),           # TTC
             'lane_keeping': build_head(d_model, d_ffn),                # LK
             'history_comfort': build_head(d_model, d_ffn),             # HC
-            'two_frame_extended_comfort': build_head(d_model, d_ffn),                 # EC
+            # 'two_frame_extended_comfort': build_head(d_model, d_ffn),                 # EC
             'ego_progress': build_head(d_model, d_ffn),                # EP
         })
 
@@ -191,29 +161,31 @@ class ScoreHead(nn.Module):
             'ego_progress': 5.0,
             'lane_keeping': 2.0,
             'history_comfort': 2.0,
-            'two_frame_extended_comfort': 2.0
+            # 'two_frame_extended_comfort': 2.0
         }
         self.sum_weights = sum(self.weights.values())
 
         self.multiplier_keys = ['no_at_fault_collisions', 'drivable_area_compliance', 
                                 'driving_direction_compliance', 'traffic_light_compliance']
         self.weighted_keys = ['time_to_collision_within_bound', 'lane_keeping', 
-                              'history_comfort', 'two_frame_extended_comfort', 'ego_progress']
+                              'history_comfort', 'ego_progress']
 
-    def forward(self, trajectories: torch.Tensor, 
+    def forward(self, traj_token: torch.Tensor, 
                 img_token, ego_token) -> Dict[str, torch.Tensor]:
         
-        B, K, L, _ = trajectories.shape
-        device = trajectories.device
+        B, K, _ = traj_token.shape
+        device = traj_token.device
 
-        trajectories = trajectories.detach().view(B, K, -1)
-        traj_token = self.traj_encoding(trajectories)
+        tr_out = self.traj_decoder(traj_token, img_token)
 
-        tr_out = self.scorer_attn(traj_token, img_token) # (B, K, D)
-        tr_out = tr_out + ego_token[:, -1, :].unsqueeze(1)
+        scorer_out = self.scorer_attn(tr_out, img_token) # (B, K, D)
+
+        proposal = self.output_layer(scorer_out).view(B, K, self.num_poses, -1)
+
+        scorer_out = scorer_out + ego_token
         logits = {}
         for name, head in self.heads.items():
-            logits[name] = head(tr_out).squeeze(-1)
+            logits[name] = head(scorer_out).squeeze(-1)
 
         # --- 4. Log-Domain 计算总分 ---
         
@@ -250,18 +222,23 @@ class ScoreHead(nn.Module):
 
         # 3. 提取最佳轨迹和所有对应的 logit 分数
         # 使用 best_indices 从 K 个候选中选出每个 batch 最佳的那个
-        best_trajectories = trajectories.view(B, K, L, -1)[batch_indices, best_indices] # (B, L, 3)
+        best_proposal = proposal[batch_indices, best_indices] # (B, L, 4)
 
-        pred_logits = torch.stack(
-            [logits[name][batch_indices, best_indices] for name in logits], dim=1)
+        # 4. 提取所有候选轨迹的 logits (B, K, 8)
+        all_pred_logits = torch.stack([logits[name] for name in self.heads.keys()], dim=-1)
+
+        # 5. （可选）如果你依然需要保留原本只含最佳轨迹分数的 pred_logits (B, 8)
+        best_pred_logits = all_pred_logits[batch_indices, best_indices] 
         
         # 7. 构建返回字典
         result = {
-            'trajectory': best_trajectories,                  # (B, L, 3)
+            'all_proposals':proposal,
+            'best_proposal': best_proposal,              # (B, L, 4
             'max_scores': max_scores,             # (B, 1) 总分
             'all_scores':log_epdms_score,                # (B, K)
-            'pred_logits': pred_logits,                     # (B, 9)
-            'best_idx': best_indices                            # (B, 1)
+            'all_pred_logits': all_pred_logits,  
+            'pred_logits': best_pred_logits,                     # (B, 8)
+            'best_indices': best_indices                            # (B, 1)
         }
         
         return result
@@ -276,15 +253,16 @@ class FlowModel(nn.Module):
         self.scene_embeds = nn.Parameter(torch.randn(1, self._config.num_cams, self._config.num_scene_tokens, self.image_backbone.num_features)*1e-6)
         
         self.hist_encoding = nn.Linear(config.hist_ego_dim, config.tf_d_model)
-        self.hist_pos_embed = nn.Parameter(torch.randn(1, config.hist_ego_len, config.tf_d_model) * 0.02)
 
-        self._traj_head = TrajHead(
-            num_poses=config.trajectory_sampling.num_poses,
-            d_ffn=config.tf_d_ffn,
-            d_model=config.tf_d_model,
-            nhead=config.vadv2_head_nhead,
-            nlayers=config.vadv2_head_nlayers,
-            config=config
+        self.vocab = nn.Parameter(
+            torch.from_numpy(np.load(config.vocab_path)),
+            requires_grad=False
+        )
+
+        self.traj_encoding = nn.Sequential(
+            nn.Linear(config.trajectory_sampling.num_poses * config.state_size, config.tf_d_ffn),
+            nn.ReLU(),
+            nn.Linear(config.tf_d_ffn, config.tf_d_model),
         )
 
         self._score_head = ScoreHead(
@@ -305,10 +283,44 @@ class FlowModel(nn.Module):
             config=config
         )
 
+    def cumsum_traj(self, model_output):
+        """
+        model_output: 模型预测输出的 Tensor，形状为 (B, 8, 4)
+                    [..., 0]=x特征, [..., 1]=y特征, [..., 2]=sin_theta, [..., 3]=cos_theta
+        """
+        # ==============================
+        # 第一步：提取 X, Y 和 Sin/Cos 特征通道
+        # ==============================
+        x_final = model_output[..., 0]
+        y_final = model_output[..., 1]
+        sin_theta = model_output[..., 2]
+        cos_theta = model_output[..., 3]
+        
+        # ==============================
+        # 第二步：还原 X 和 Y 的物理坐标（保持原有逻辑）
+        # ==============================
+        x_log = x_final * (self._config.x_std + 1e-8) + self._config.x_mean
+        y_diff = y_final * (self._config.y_std + 1e-8) + self._config.y_mean
+
+        x_diff = torch.sign(x_log) * torch.expm1(torch.abs(x_log))
+        x_recovered = torch.cumsum(x_diff, dim=1)
+        y_recovered = torch.cumsum(y_diff, dim=1)
+        
+        # ==============================
+        # 第三步：还原绝对角度 Theta
+        # ==============================
+        # 1. 利用 atan2(sin, cos) 将 sin/cos 映射回 [-pi, pi] 范围内的角度差值
+        delta_theta = torch.atan2(sin_theta, cos_theta)
+        
+        # 2. 沿着时间步累加角度差值，得到绝对的航向角
+        theta_recovered = torch.cumsum(delta_theta, dim=1)
+        
+        return torch.stack([x_recovered, y_recovered, theta_recovered], dim=-1)
+
     def forward(self, features: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         # image, bev, agent, traj, score
         camera_feature: torch.Tensor = features["image"]
-        status_feature: torch.Tensor = features["ego_status"]
+        status_feature: torch.Tensor = features["ego_status"][:, -1:]
         
         batch_size = status_feature.shape[0]
 
@@ -320,19 +332,36 @@ class FlowModel(nn.Module):
         #                         self._config.tf_d_model)
         
         ego_token = self.hist_encoding(status_feature)
-        ego_token = ego_token + self.hist_pos_embed
+        #(B,21476,8,4)
+        vocab_proposal = self.vocab.unsqueeze(0).expand(batch_size, -1, -1, -1)
+        #(B,21476,D)
+        vocab_token = self.traj_encoding(vocab_proposal.view(batch_size, -1, self._config.trajectory_sampling.num_poses * self._config.state_size))
 
-        flow_proposal = self._flow_head(img_token, ego_token)
+        output = {}
 
-        traj_proposal = self._traj_head(flow_proposal, img_token)
+        output['vocab'] = self._score_head(vocab_token, img_token, ego_token)
+        output['vocab']['best_vocab'] = vocab_proposal[torch.arange(batch_size), output['vocab']['best_indices']]
 
-        output = self._score_head(traj_proposal, img_token, ego_token)
+        score_weights = output['vocab']['all_scores'].softmax(dim=-1).unsqueeze(-1)
+        #(B,21476,D)
+        weighted_vocab_token = vocab_token * score_weights
+
+        flow_proposal = self._flow_head(img_token, ego_token, weighted_vocab_token)
+
+        flow_token = self.traj_encoding(flow_proposal.view(batch_size, self.num_proposals, -1))
+
+        output['flow'] = self._score_head(flow_token, img_token, ego_token)
 
         output['img_token'] = img_token
         output['ego_token'] = ego_token
+        output['vocab_token'] = vocab_token
+
+        which_better = output['vocab']['max_scores'] > output['flow']['max_scores']
+        which_better = which_better.view(-1, 1, 1) 
+        output['max_scores'] = torch.where(which_better, output['vocab']['max_scores'], output['flow']['max_scores'])
         
-        output['flow_proposal'] = flow_proposal
-        output['traj_proposal'] = traj_proposal
+        output['trajectory'] = torch.where(which_better, output['vocab']['best_vocab'], output['flow']['best_proposal'])
+        output['trajectory'] = self.cumsum_traj(output['trajectory'])
 
         return output
 

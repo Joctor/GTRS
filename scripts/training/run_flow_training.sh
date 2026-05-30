@@ -4,7 +4,6 @@ experiment_name=train_flow
 agent=flow_agent
 cache_path=$NAVSIM_EXP_ROOT/flow_agent_navtrain_dataset_caching/
 metric_cache_path=$NAVSIM_EXP_ROOT/navtrain_metric_cache/
-pdm_result_path=$NAVSIM_EXP_ROOT/pdm_result.csv
 
 # training hyper-parameters
 lr=0.0002
@@ -24,8 +23,6 @@ torchrun --nproc_per_node=gpu $NAVSIM_DEVKIT_ROOT/navsim/planning/script/run_tra
     force_cache_computation=false \
     cache_path=$cache_path \
     metric_cache_path=$metric_cache_path \
-    agent.config.pdm_result_path=$pdm_result_path \
-    worker.threads_per_node=16 \
     #+resume_ckpt_path=/root/ckpt/last.ckpt
     # trainer.params.accelerator=cpu
     # trainer.params.num_nodes=${NUM_NODES} \

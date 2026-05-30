@@ -157,8 +157,8 @@ class FlowFeatureBuilder(AbstractFeatureBuilder):
 class FlowTargetBuilder(AbstractTargetBuilder):
     def __init__(self, config: FlowConfig):
         self._config = config
-        self.pdm_df = pd.read_csv(config.pdm_result_path)
-        self.pdm_df = self.pdm_df[self.pdm_df['valid'] == True]
+        # self.pdm_df = pd.read_csv(config.pdm_result_path)
+        # self.pdm_df = self.pdm_df[self.pdm_df['valid'] == True]
 
     def get_unique_name(self) -> str:
         """Inherited, see superclass."""
@@ -172,7 +172,7 @@ class FlowTargetBuilder(AbstractTargetBuilder):
         trajectory = torch.tensor(future_traj.poses)
         frame_idx = scene.scene_metadata.num_history_frames - 1
 
-        gt_score = self._get_pdm_result(scene.frames[frame_idx].token)
+        # gt_score = self._get_pdm_result(scene.frames[frame_idx].token)
 
         # annotations = scene.frames[frame_idx].annotations
         # ego_pose = StateSE2(*scene.frames[frame_idx].ego_status.ego_pose)
@@ -182,7 +182,7 @@ class FlowTargetBuilder(AbstractTargetBuilder):
 
         return {
             "trajectory": trajectory,
-            "gt_score": gt_score,
+            # "gt_score": gt_score,
             # "agent_states": agent_states,
             # "agent_labels": agent_labels,
             # "bev_semantic_map": bev_semantic_map,

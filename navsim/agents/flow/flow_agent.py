@@ -1,4 +1,5 @@
 import os
+import numpy as np
 from typing import Any, Dict, List, Optional, Union
 
 import pytorch_lightning as pl
@@ -81,7 +82,7 @@ class FlowAgent(AbstractAgent):
             config: FlowConfig,
             lr: float,
             checkpoint_path: Optional[str] = None,
-            **kwargs
+            pdm_gt_path=None,
     ):
         """
         Initializes TransFuser agent.
@@ -99,15 +100,8 @@ class FlowAgent(AbstractAgent):
         self._checkpoint_path = checkpoint_path
         self.model = FlowModel(config)
 
-        self.worker = kwargs.get('worker')
-        self.metric_cache_loader = MetricCacheLoader(Path(kwargs.get('metric_cache_path')))
-        self.simulator: PDMSimulator = kwargs.get('simulator')
-        self.scorer: PDMScorer = kwargs.get('scorer')
-        assert (
-        self.simulator.proposal_sampling == self.scorer.proposal_sampling
-        ), "Simulator and scorer proposal sampling has to be identical"
-
-        self.reactive_policy: NavsimIDMAgents = kwargs.get('reactive_policy')
+        with np.load(pdm_gt_path) as data:
+            self.vocab_score = {k: torch.from_numpy(data[k]) for k in data.files}
 
     def name(self) -> str:
         """Inherited, see superclass."""
@@ -248,6 +242,51 @@ class FlowAgent(AbstractAgent):
 
         return total_loss, loss_dict
 
+    def diff_traj(self, traj_batch):
+        """
+        traj_batch: 形状为 (B, 8, 3) 的原始轨迹 Tensor
+                    其中 traj_batch[..., 0] = x, [..., 1] = y, [..., 2] = theta
+        """
+        B, L, _ = traj_batch.shape
+        
+        # ==============================
+        # 第一步：提取坐标并计算差分
+        # ==============================
+        x = traj_batch[:, :, 0]
+        y = traj_batch[:, :, 1]
+        theta = traj_batch[:, :, 2]
+        
+        # 沿着时间步（dim=1）做差分，prepend 第一个时刻为 0
+        x_diff = torch.diff(x, n=1, dim=1, prepend=torch.zeros(B, 1, device=traj_batch.device))
+        y_diff = torch.diff(y, n=1, dim=1, prepend=torch.zeros(B, 1, device=traj_batch.device))
+        delta_theta = torch.diff(theta, n=1, dim=1, prepend=torch.zeros(B, 1, device=traj_batch.device))
+        
+        # 将角度差值限制在 [-pi, pi] 之间（处理跨越 2pi 的情况）
+        delta_theta = torch.fmod(delta_theta + torch.pi, 2 * torch.pi) - torch.pi
+
+        # ==============================
+        # 第二步：特征变换（X轴 Log + Z-score，Y轴 Z-score，Theta Sin/Cos）
+        # ==============================
+        
+        # 【X轴】带符号的 Log1p 变换 + Z-score
+        x_log = torch.sign(x_diff) * torch.log1p(torch.abs(x_diff))
+        x_final = (x_log - self._config.x_mean) / (self._config.x_std + 1e-8)
+        
+        # 【Y轴】常规 Z-score 标准化
+        y_final = (y_diff - self._config.y_mean) / (self._config.y_std + 1e-8)
+        
+        # 【角度】Sin/Cos 映射
+        sin_theta = torch.sin(delta_theta)
+        cos_theta = torch.cos(delta_theta)
+        
+        # ==============================
+        # 第三步：拼接成最终模型输入特征
+        # ==============================
+        # 最终形状为 (B, 8, 4)，分别对应 [x_feat, y_feat, sin, cos]
+        final_features = torch.stack([x_final, y_final, sin_theta, cos_theta], dim=-1)
+        
+        return final_features
+
     def compute_loss(
             self,
             features: Dict[str, torch.Tensor],
@@ -255,45 +294,29 @@ class FlowAgent(AbstractAgent):
             predictions: Dict[str, torch.Tensor],
             tokens
     ):
-
-        gt_predictions = self.model._score_head.forward(targets['trajectory'].unsqueeze(1).float(), 
-                                       predictions['img_token'], 
-                                       predictions['ego_token'])
-        gt_score_loss, gt_score_loss_dict = self.get_score_loss(
-            'gt',gt_predictions['pred_logits'], targets['gt_score'])
-        
-        flow_loss = self.model._flow_head.get_flow_loss(targets, predictions)
-        
         # 放在开头算居然会报错
-        tensor_df, sample_weights, good_mask = self.get_pred_traj_pdm_score(predictions['trajectory'].detach().cpu().numpy(), tokens)
+        # tensor_df, sample_weights, good_mask = self.get_pred_traj_pdm_score(predictions['trajectory'].detach().cpu().numpy(), tokens)
         
-        pred_score_loss, pred_score_loss_dict = self.get_score_loss(
-            'pred', 
-            predictions['pred_logits'], 
-            tensor_df, 
-            sample_weights=sample_weights
-        )
+        gt_traj = self.diff_traj(targets['trajectory'].float())
+        cur_vocab_score = torch.stack([self.vocab_score[token] for token in tokens])
+        mask = (cur_vocab_score[:, :, [0, 2]] == 0.5)
+        cur_vocab_score[:, :, [0, 2]][mask] = 0.0
 
-        if torch.any(good_mask):
-            flow_loss += self.model._flow_head.get_flow_loss(targets, predictions, good_mask, tensor_df)
+        flow_loss = self.model._flow_head.get_flow_loss(predictions, gt_traj, cur_vocab_score)
+        
+        pred_logits = predictions['vocab']['all_pred_logits'] 
+        elementwise_loss = F.binary_cross_entropy_with_logits(pred_logits, cur_vocab_score, reduction='none')
+        metric_weights = torch.tensor([20.0, 20.0, 20.0, 20.0, 1.0, 1.0, 1.0, 1.0], device=pred_logits.device)
+        score_loss = (elementwise_loss * metric_weights).mean()
 
-        gt_traj = targets['trajectory'].float()
-        heading = gt_traj[..., -1:] 
-        sin_heading = torch.sin(heading)
-        cos_heading = torch.cos(heading)
-        #(B,1,8,4)
-        gt_traj = torch.cat([gt_traj[..., :2],sin_heading,cos_heading], dim=-1).unsqueeze(1)
+        loss_dict = {}
+        metric = ['nc', 'dac', 'ddc', 'tlc','ttc', 'lk', 'hc', 'ep']
+        for i, name in enumerate(metric):
+            loss_dict[f'{name}_loss'] = elementwise_loss[:, :, i].mean().item()
 
-        pred_heading = predictions['traj_proposal'][..., -1:]
-        pred_sin_heading = torch.sin(pred_heading)
-        pred_cos_heading = torch.cos(pred_heading)
-        pred_traj = torch.cat([predictions['traj_proposal'][..., :2], pred_sin_heading, pred_cos_heading], dim=-1)
-
-        dists = torch.norm(pred_traj - gt_traj, dim=-1, p=1).mean(dim=-1)
+        dists = torch.norm(predictions['flow']['all_proposals'] - gt_traj.unsqueeze(1), dim=-1, p=1).mean(dim=-1)
         mindist_loss = torch.min(dists, dim=1)[0].mean()
         
-        # ec_pred_logit = predictions['pred_logits'][:, -2]
-
         # bev_semantic_loss = F.cross_entropy(predictions["bev_semantic_map"], targets["bev_semantic_map"].long())
         
         # dp_loss = dp_loss * config.dp_loss_weight
@@ -301,8 +324,7 @@ class FlowAgent(AbstractAgent):
         total_loss = (
                 flow_loss +
                 mindist_loss +
-                gt_score_loss +
-                pred_score_loss
+                score_loss
                 # bev_semantic_loss
         )
 
@@ -314,10 +336,8 @@ class FlowAgent(AbstractAgent):
             'max_scores': torch.mean(predictions['max_scores']).float(),
             'flow_loss': flow_loss.float(),
             'mindist_loss': mindist_loss.float(),
-            'gt_score_loss': gt_score_loss.float(),
-            **gt_score_loss_dict,
-            'pred_score_loss': pred_score_loss.float(),
-            **pred_score_loss_dict,
+            'score_loss': score_loss.float(),
+            **loss_dict,
         }
 
     def get_optimizers(self):
@@ -354,8 +374,8 @@ class FlowAgent(AbstractAgent):
         ckpt_callback_best = ModelCheckpoint(
             save_top_k=1,
             save_last=True,
-            monitor="val/max_scores",
-            mode="max",
+            monitor="val/total_loss",
+            mode="min",
             dirpath=f"/root/ckpt/",
             filename="best-{epoch:02d}-{step:04d}"
         )

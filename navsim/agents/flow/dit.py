@@ -107,15 +107,12 @@ class MFDiT(nn.Module):
         self.t_embed = TimestepEmbedder(hidden_size)
         
         self.pos_embed = nn.Parameter(torch.zeros(1, num_poses, hidden_size))
-
-        self.score_embed = nn.Sequential(
-                nn.Linear(9, hidden_size),
-                nn.ReLU(),
-                nn.Linear(hidden_size, hidden_size)
-            )
         
         self.global_attn = nn.MultiheadAttention(hidden_size, num_heads, batch_first=True)
         self.scene_query = nn.Parameter(torch.randn(1, 1, hidden_size))
+
+        self.vocab_attn = nn.MultiheadAttention(hidden_size, num_heads, batch_first=True)
+        self.vocab_query = nn.Parameter(torch.randn(1, 1, hidden_size))
 
         self.blocks = nn.ModuleList([
             DiTBlock(hidden_size, num_heads) for _ in range(depth)
@@ -150,7 +147,7 @@ class MFDiT(nn.Module):
 
 
     # (zt | t, bev, ego, score)
-    def forward(self, z_t, t, img_emb, ego_emb, pdmscore):
+    def forward(self, z_t, t, img_emb, ego_emb, vocab_emb):
         """
         z_t: (B, L=8, D=3)
         t: (B, 1, 1)
@@ -161,12 +158,14 @@ class MFDiT(nn.Module):
 
         time_emb = self.t_embed(t.squeeze(-1).squeeze(-1))       # (B, 8, H)
 
-        score_emb = self.score_embed(pdmscore)
-
         img_global, _ = self.global_attn(self.scene_query.expand(B, -1, -1), img_emb, img_emb)
         img_global = img_global.squeeze(1) # (B, D)
         ego_current = ego_emb[:, -1, :] # (B, D)
-        condition = torch.cat([time_emb, img_global, ego_current, score_emb], dim=-1)
+        
+        vocab_global, _ = self.vocab_attn(self.vocab_query.expand(B, -1, -1), vocab_emb, vocab_emb)
+        vocab_global = vocab_global.squeeze(1) # (B, D)
+
+        condition = torch.cat([time_emb, img_global, ego_current, vocab_global], dim=-1)
 
         kv = torch.cat([img_emb, ego_emb], dim=1)
         
@@ -181,15 +180,15 @@ class MFDiT(nn.Module):
 
 
 if __name__ == "__main__":
-    B, K, D = 128, 64, 24
+    B, K, D = 128, 8, 4
     model = MFDiT(input_size=D, num_poses=K, hidden_size=256, depth=2, num_heads=4)
 
     z_t = torch.randn(B, K, D)              
     t = torch.rand(B, 1, 1)                    
-    img_token = torch.randn(B, K, 256)              
+    img_token = torch.randn(B, 64, 256)              
     ego_token = torch.randn(B, 4, 256)
-    pdmscore = torch.randn(B, 9)        
+    vocab_token = torch.randn(B, 111, 256)
 
-    output = model(z_t, t, img_token, ego_token, pdmscore)
+    output = model(z_t, t, img_token, ego_token, vocab_token)
     print("Input z_t shape:", z_t.shape)
     print("Output shape:", output.shape)

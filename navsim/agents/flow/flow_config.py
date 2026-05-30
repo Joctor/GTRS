@@ -17,8 +17,14 @@ class FlowConfig(TransfuserConfig):
     use_hist_ego_status: bool = True
     hist_ego_len = 4
     hist_ego_dim = 11
-    state_size = 3
+    state_size = 4
 
+    # 24576_processed.npy
+    x_mean = 1.1202012601214466
+    x_std = 0.5699973756416573
+    y_mean = 0.03726131206134561
+    y_std = 0.6315431983400145
+    
     ref_num = 4
     refiner_num_heads = 1
     refiner_ls_values = 0
@@ -35,8 +41,6 @@ class FlowConfig(TransfuserConfig):
     focus_front_cam: bool = False
     use_feature_pooling: bool = False
     compress_fc: bool = False
-
-    pdm_result_path: str = '####################'
 
     scheduler: str = 'default'
 

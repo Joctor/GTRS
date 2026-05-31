@@ -28,7 +28,7 @@ class FlowHead(nn.Module):
               depth=nlayers, 
               num_heads=nhead)
 
-    def forward(self, img_token, ego_token, weighted_vocab_token):
+    def forward(self, img_token, ego_token, topk_vocab_token):
         B = img_token.shape[0]
         device = img_token.device
         K = self.num_proposals
@@ -37,7 +37,7 @@ class FlowHead(nn.Module):
         
         img_token_flat = img_token.repeat_interleave(K, dim=0)
         ego_token_flat = ego_token.repeat_interleave(K, dim=0)
-        weighted_vocab_token_flat = weighted_vocab_token.repeat_interleave(K, dim=0)
+        topk_vocab_token_flat = topk_vocab_token.repeat_interleave(K, dim=0)
         
         num_steps = 10 
         dt = 1.0 / num_steps
@@ -47,9 +47,9 @@ class FlowHead(nn.Module):
             # 形状必须是 (B, 1, 1)，对应合并后的 Batch 维度
             t_val = torch.full((B*K, 1, 1), i * dt, device=device)
             
-            v_t_cond = self.mfdit(x_t, t_val, img_token_flat, ego_token_flat, weighted_vocab_token_flat)
+            v_t_cond = self.mfdit(x_t, t_val, img_token_flat, ego_token_flat, topk_vocab_token_flat)
 
-            zeros_token = torch.zeros_like(weighted_vocab_token_flat, device=device)
+            zeros_token = torch.zeros_like(topk_vocab_token_flat, device=device)
             v_t_uncond = self.mfdit(x_t, t_val, img_token_flat, ego_token_flat, zeros_token)
 
             v_t = v_t_uncond + 2 * (v_t_cond - v_t_uncond)
@@ -63,10 +63,11 @@ class FlowHead(nn.Module):
     
     def get_flow_loss(self, predictions, gt_traj, vocab_score):
         B = gt_traj.shape[0]
-            img_token = predictions['img_token']
-            ego_token = predictions['ego_token']
+        img_token = predictions['img_token']
+        ego_token = predictions['ego_token']
+        #(B,OOM/2,D)
         vocab_token = predictions['vocab_token']
-            device = img_token.device
+        device = img_token.device
 
         multiplier_logits = vocab_score[..., :4]
         log_multiplier_sum = -F.softplus(-multiplier_logits).sum(dim=-1) 
@@ -74,19 +75,22 @@ class FlowHead(nn.Module):
         weighted_logits = vocab_score[..., 4:]
         weighted_probs = torch.sigmoid(weighted_logits)
         # ttc,lk,hc,ep
-        weighted_sum_prob = (weighted_probs * torch.tensor([5.0, 2.0, 2.0, 5.0], device=device)).sum(dim=-1) / 14.0
+        weights = torch.tensor([5.0, 2.0, 2.0, 5.0], device=device)
+        weighted_sum_prob = (weighted_probs * weights).sum(dim=-1) / weights.sum()
         log_weighted_sum = torch.log(weighted_sum_prob.clamp(min=1e-8))
-        
+
+        #(B,OOM/2)
         combined_score = log_multiplier_sum + log_weighted_sum
-        #(B, K, 1)
-        score_weights = combined_score.softmax(dim=-1).unsqueeze(-1)
+    
+        #(B,K)
+        _, topk_indices = torch.topk(combined_score, k=self.num_proposals, dim=1)
         #(B, K, D)
-        weighted_vocab_token = vocab_token * score_weights
+        topk_vocab_token = vocab_token[torch.arange(B, device=device).unsqueeze(1), topk_indices]
         
         drop_mask = torch.rand(B, 1, 1) < 0.2
-        weighted_vocab_token = torch.where(drop_mask.to(device), 
-                                           torch.zeros_like(weighted_vocab_token, device=device), 
-                                           weighted_vocab_token)
+        topk_vocab_token = torch.where(drop_mask.to(device), 
+                                           torch.zeros_like(topk_vocab_token, device=device), 
+                                           topk_vocab_token)
         
         x_1 = gt_traj
 
@@ -102,7 +106,7 @@ class FlowHead(nn.Module):
         cvf = (x_1 - x_0)
         
         # 预测
-        v_t = self.mfdit(z_t, t, img_token, ego_token, weighted_vocab_token)
+        v_t = self.mfdit(z_t, t, img_token, ego_token, topk_vocab_token)
         
         flow_loss = F.mse_loss(v_t, cvf)
 
@@ -173,14 +177,14 @@ class ScoreHead(nn.Module):
     def forward(self, traj_token: torch.Tensor, 
                 img_token, ego_token) -> Dict[str, torch.Tensor]:
         
-        B, K, _ = traj_token.shape
+        B, OOM, _ = traj_token.shape
         device = traj_token.device
 
         tr_out = self.traj_decoder(traj_token, img_token)
 
-        scorer_out = self.scorer_attn(tr_out, img_token) # (B, K, D)
-
-        proposal = self.output_layer(scorer_out).view(B, K, self.num_poses, -1)
+        scorer_out = self.scorer_attn(tr_out, img_token) # (B, OOM, D)
+        
+        proposal = self.output_layer(scorer_out).view(B, OOM, self.num_poses, -1)
 
         scorer_out = scorer_out + ego_token
         logits = {}
@@ -190,7 +194,7 @@ class ScoreHead(nn.Module):
         # --- 4. Log-Domain 计算总分 ---
         
         # A. Multiplier 部分: Sum of Log-Probs
-        log_multiplier_sum = torch.zeros(B, K, device=device)
+        log_multiplier_sum = torch.zeros(B, OOM, device=device)
         for key in self.multiplier_keys:
             x = logits[key]
             # ln(sigmoid(x)) = -softplus(-x)
@@ -198,7 +202,7 @@ class ScoreHead(nn.Module):
             log_multiplier_sum += log_p
         
         # B. Weighted 部分: Log(Sum of Weighted Probs)
-        weighted_sum_prob = torch.zeros(B, K, device=device)
+        weighted_sum_prob = torch.zeros(B, OOM, device=device)
         for key in self.weighted_keys:
             x = logits[key]
             p = torch.sigmoid(x)
@@ -209,12 +213,13 @@ class ScoreHead(nn.Module):
         log_weighted_sum = torch.log(weighted_sum_prob.clamp(min=epsilon))
 
         # C. 最终 Log-Score
-        log_epdms_score = log_multiplier_sum + log_weighted_sum # (B, K)
+        log_epdms_score = log_multiplier_sum + log_weighted_sum # (B, OOM)
 
         # 1. 获取最高分数和对应的索引
         # max_scores: (B,), 包含每个 batch 中的最高分
         # best_indices: (B,), 包含每个 batch 中最高分轨迹的索引
         max_scores, best_indices = torch.max(log_epdms_score, dim=1)
+        _, topk_indices = torch.topk(log_epdms_score, k=self.num_proposals, dim=1)
 
         # 2. 准备用于高级索引的 batch 索引
         # 创建一个形如 [0, 1, 2, ..., B-1] 的张量
@@ -224,21 +229,20 @@ class ScoreHead(nn.Module):
         # 使用 best_indices 从 K 个候选中选出每个 batch 最佳的那个
         best_proposal = proposal[batch_indices, best_indices] # (B, L, 4)
 
-        # 4. 提取所有候选轨迹的 logits (B, K, 8)
-        all_pred_logits = torch.stack([logits[name] for name in self.heads.keys()], dim=-1)
+        batch_indices = batch_indices.unsqueeze(1)
+        topk_proposal = proposal[batch_indices, topk_indices] # (B, K, L, 4)
 
-        # 5. （可选）如果你依然需要保留原本只含最佳轨迹分数的 pred_logits (B, 8)
-        best_pred_logits = all_pred_logits[batch_indices, best_indices] 
+        # 4. 提取所有候选轨迹的 logits (B, OOM, 8)
+        all_pred_logits = torch.stack([logits[name] for name in self.heads.keys()], dim=-1)
         
         # 7. 构建返回字典
         result = {
-            'all_proposals':proposal,
-            'best_proposal': best_proposal,              # (B, L, 4
-            'max_scores': max_scores,             # (B, 1) 总分
-            'all_scores':log_epdms_score,                # (B, K)
-            'all_pred_logits': all_pred_logits,  
-            'pred_logits': best_pred_logits,                     # (B, 8)
-            'best_indices': best_indices                            # (B, 1)
+            'best_proposal': best_proposal,       # (B, L, 4)
+            'topk_proposal': topk_proposal,       # (B, K, L, 4)
+            'max_scores': max_scores,             # (B, 1)
+            'best_indices': best_indices,         # (B, 1)
+            'topk_indices':topk_indices,          # (B, K)
+            'all_pred_logits': all_pred_logits,   # (B, OOM, 8)
         }
         
         return result
@@ -332,21 +336,34 @@ class FlowModel(nn.Module):
         #                         self._config.tf_d_model)
         
         ego_token = self.hist_encoding(status_feature)
-        #(B,21476,8,4)
-        vocab_proposal = self.vocab.unsqueeze(0).expand(batch_size, -1, -1, -1)
-        #(B,21476,D)
-        vocab_token = self.traj_encoding(vocab_proposal.view(batch_size, -1, self._config.trajectory_sampling.num_poses * self._config.state_size))
 
         output = {}
 
+        num_total = self.vocab.shape[0]
+        if self.training:
+            num_select = num_total // 2  # 8192
+            dropout_indices = torch.randperm(num_total, device=self.vocab.device)[:num_select]
+        else:
+            dropout_indices = torch.arange(num_total, device=self.vocab.device)
+        
+        output['dropout_indices'] = dropout_indices
+        
+        #(OOM/2,8,4)
+        cur_vocab = self.vocab[dropout_indices]
+
+        #(B,OOM/2,8,4)
+        vocab_proposal = cur_vocab.unsqueeze(0).expand(batch_size, -1, -1, -1)
+        
+        #(B,OOM/2,D)
+        vocab_token = self.traj_encoding(vocab_proposal.view(batch_size, -1, self._config.trajectory_sampling.num_poses * self._config.state_size))
+
         output['vocab'] = self._score_head(vocab_token, img_token, ego_token)
+        
         output['vocab']['best_vocab'] = vocab_proposal[torch.arange(batch_size), output['vocab']['best_indices']]
-
-        score_weights = output['vocab']['all_scores'].softmax(dim=-1).unsqueeze(-1)
-        #(B,21476,D)
-        weighted_vocab_token = vocab_token * score_weights
-
-        flow_proposal = self._flow_head(img_token, ego_token, weighted_vocab_token)
+        #(B,K,D)
+        topk_vocab_token = vocab_token[torch.arange(batch_size).unsqueeze(1), output['vocab']['topk_indices']]
+        
+        flow_proposal = self._flow_head(img_token, ego_token, topk_vocab_token)
 
         flow_token = self.traj_encoding(flow_proposal.view(batch_size, self.num_proposals, -1))
 

@@ -167,7 +167,7 @@ class MFDiT(nn.Module):
 
         condition = torch.cat([time_emb, img_global, ego_current, vocab_global], dim=-1)
 
-        kv = torch.cat([img_emb, ego_emb], dim=1)
+        kv = torch.cat([img_emb, ego_emb, vocab_emb], dim=1)
         
         x = zt_emb
         # 4. Pass through blocks

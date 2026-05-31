@@ -100,8 +100,11 @@ class FlowAgent(AbstractAgent):
         self._checkpoint_path = checkpoint_path
         self.model = FlowModel(config)
 
-        with np.load(pdm_gt_path) as data:
-            self.vocab_score = {k: torch.from_numpy(data[k]) for k in data.files}
+        # # load in memory
+        # with np.load(pdm_gt_path) as data:
+        #     self.vocab_score = {k: torch.from_numpy(data[k]) for k in data.files}
+        # not in
+        self.vocab_score = np.load(pdm_gt_path, mmap_mode='r')
 
     def name(self) -> str:
         """Inherited, see superclass."""
@@ -296,11 +299,23 @@ class FlowAgent(AbstractAgent):
     ):
         # 放在开头算居然会报错
         # tensor_df, sample_weights, good_mask = self.get_pred_traj_pdm_score(predictions['trajectory'].detach().cpu().numpy(), tokens)
-        
+        dropout_indices = predictions['dropout_indices']
+
+        #(B,8,4)
         gt_traj = self.diff_traj(targets['trajectory'].float())
-        cur_vocab_score = torch.stack([self.vocab_score[token] for token in tokens])
+
+        #(B,OOM,8)
+        # # load in memory
+        #cur_vocab_score = torch.stack([self.vocab_score[token] for token in tokens])
+        # not in
+        cur_vocab_score = torch.stack([torch.from_numpy(self.vocab_score[token].copy()) for token in tokens])
+        
+        #(B,OOM/2,8)
+        cur_vocab_score = cur_vocab_score[:, dropout_indices]
+        
         mask = (cur_vocab_score[:, :, [0, 2]] == 0.5)
         cur_vocab_score[:, :, [0, 2]][mask] = 0.0
+        cur_vocab_score = cur_vocab_score.to(gt_traj.device) 
 
         flow_loss = self.model._flow_head.get_flow_loss(predictions, gt_traj, cur_vocab_score)
         
@@ -314,7 +329,7 @@ class FlowAgent(AbstractAgent):
         for i, name in enumerate(metric):
             loss_dict[f'{name}_loss'] = elementwise_loss[:, :, i].mean().item()
 
-        dists = torch.norm(predictions['flow']['all_proposals'] - gt_traj.unsqueeze(1), dim=-1, p=1).mean(dim=-1)
+        dists = torch.norm(predictions['flow']['topk_proposal'] - gt_traj.unsqueeze(1), dim=-1, p=1).mean(dim=-1)
         mindist_loss = torch.min(dists, dim=1)[0].mean()
         
         # bev_semantic_loss = F.cross_entropy(predictions["bev_semantic_map"], targets["bev_semantic_map"].long())

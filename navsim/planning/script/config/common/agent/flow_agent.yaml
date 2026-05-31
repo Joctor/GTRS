@@ -1,11 +1,11 @@
 _target_: navsim.agents.flow.flow_agent.FlowAgent
 _convert_: 'all'
-pdm_gt_path: ${oc.env:NAVSIM_DEVKIT_ROOT}/navtrain_24576x8.npz
+pdm_gt_path: ${oc.env:NAVSIM_DEVKIT_ROOT}/navtrain_16384x8.npz
 
 config:
   _target_: navsim.agents.flow.flow_config.FlowConfig
   _convert_: 'all'
-  vocab_path: ${oc.env:NAVSIM_DEVKIT_ROOT}/traj_final/24576_processed.npy
+  vocab_path: ${oc.env:NAVSIM_DEVKIT_ROOT}/traj_final/16384_processed.npy
   seq_len: 2
   ckpt_path: dp_ckpt
   lidar_seq_len: 4

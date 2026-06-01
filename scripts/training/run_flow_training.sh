@@ -7,7 +7,7 @@ metric_cache_path=$NAVSIM_EXP_ROOT/navtrain_metric_cache/
 
 # training hyper-parameters
 lr=0.0002
-bs=27 #96GB
+bs=16 #96GB
 max_epochs=2
 
 torchrun --nproc_per_node=gpu $NAVSIM_DEVKIT_ROOT/navsim/planning/script/run_training_dense.py \

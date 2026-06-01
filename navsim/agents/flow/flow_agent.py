@@ -112,9 +112,14 @@ class FlowAgent(AbstractAgent):
 
     def initialize(self) -> None:
         """Inherited, see superclass."""
-        state_dict: Dict[str, Any] = torch.load(self._checkpoint_path, map_location=torch.device("cpu"))[
-            "state_dict"]
-        self.load_state_dict({k.replace("agent.", ""): v for k, v in state_dict.items()})
+        state_dict: Dict[str, Any] = torch.load(self._checkpoint_path, map_location=torch.device("cpu"))["state_dict"]
+        # Remove keys containing 'model._trajectory_head.vocab'
+        keys_to_delete = [k for k in state_dict if "model.vocab" in k]
+        for k in keys_to_delete:
+            del state_dict[k]
+
+        msg = self.load_state_dict({k.replace("agent.", ""): v for k, v in state_dict.items()}, strict=False)
+        print('Loading full GTRS model', msg)
 
     def get_sensor_config(self) -> SensorConfig:
         """Inherited, see superclass."""
@@ -310,12 +315,11 @@ class FlowAgent(AbstractAgent):
         # not in
         cur_vocab_score = torch.stack([torch.from_numpy(self.vocab_score[token].copy()) for token in tokens])
         
-        #(B,OOM/2,8)
-        cur_vocab_score = cur_vocab_score[:, dropout_indices]
-        
         mask = (cur_vocab_score[:, :, [0, 2]] == 0.5)
         cur_vocab_score[:, :, [0, 2]][mask] = 0.0
         cur_vocab_score = cur_vocab_score.to(gt_traj.device) 
+        #(B,OOM/2,8)
+        cur_vocab_score = cur_vocab_score[:, dropout_indices]
 
         flow_loss = self.model._flow_head.get_flow_loss(predictions, gt_traj, cur_vocab_score)
         
